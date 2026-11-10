@@ -1,4 +1,7 @@
-node_modules/
+# Bare name (no trailing slash) so a file or symlink named node_modules is
+# ignored too — `node_modules/` only matches directories, which let an
+# accidentally committed machine-specific symlink through (PR #207 review).
+node_modules
 *.log
 .DS_Store
 
@@ -13,3 +16,9 @@ docs/video-script.md
 
 # E2E run artifacts (temp DSH home, decoded logs, credentials env-file — never commit)
 scripts/e2e/out/
+
+# Local-only working artifacts (never push)
+dsh-routing-suite/
+.agent-teams/
+0001-*.patch
+压缩的仓库用法.txt

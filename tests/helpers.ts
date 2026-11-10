@@ -28,6 +28,7 @@ export function appendAssistant(session: Session, text: string, turn = 1, step =
   session.append('assistant/message', {
     turn,
     step,
+    stream: [],
     message: createAssistantMessage({
       content: [{ type: 'text', text }],
       provider: 'test-provider',
@@ -40,6 +41,7 @@ export function appendToolCall(session: Session, text: string, callId: string, t
   session.append('assistant/message', {
     turn,
     step,
+    stream: [],
     message: createAssistantMessage({
       content: [
         { type: 'text', text },
@@ -67,12 +69,14 @@ export function appendToolResult(session: Session, text: string, callId: string,
 /**
  * An assistant message carrying MULTIPLE tool-call blocks in one content list —
  * the real DSH shape whose projection yields `${seq}#${callId}` CoreMessage
- * ids (no bare `${seq}` ref, so it can never be a compress range edge).
+ * sub-ids (no bare `${seq}` ref; a legal range edge only on its START side —
+ * issue #155).
  */
 export function appendMultiToolCall(session: Session, text: string, callIds: readonly string[], turn = 1, step = 1): void {
   session.append('assistant/message', {
     turn,
     step,
+    stream: [],
     message: createAssistantMessage({
       content: [
         { type: 'text', text },
@@ -84,13 +88,69 @@ export function appendMultiToolCall(session: Session, text: string, callIds: rea
   }, { surfaceOp: 'append' })
 }
 
+/**
+ * A tool result with EMPTY content (e.g. a grep/glob that matched nothing) —
+ * the real DSH shape whose projection yields NO CoreMessage at all, so it
+ * carries no kernel ref of any kind (issue #155). dsh-session accepts the
+ * empty nested content array.
+ */
+export function appendEmptyToolResult(session: Session, callId: string, turn = 1, step = 1): void {
+  session.append('tool/result', {
+    turn,
+    step,
+    message: {
+      id: `res-${callId}`,
+      role: 'user',
+      content: [{ type: 'tool-result', toolCallId: callId, content: [] }],
+      source: { kind: 'tool', callId },
+    },
+  }, { surfaceOp: 'append' })
+}
+
 /** A session with `count` alternating user/assistant text messages inside one open turn. */
-export function buildTextSession(count: number): Session {
-  const session = Session.create('test-session')
+export function buildTextSession(count: number, id: string = 'test-session'): Session {
+  const session = Session.create(id)
   appendTurn(session, 1)
   for (let index = 0; index < count; index += 1) {
     if (index % 2 === 0) appendUser(session, longText('msg', index))
     else appendAssistant(session, longText('reply', index), 1, index)
   }
   return session
+}
+
+/** Short (~87-char, fixed-length) counterpart to buildTextSession: small enough that several messages fit under one decompress page's char budget, so paging/limit assertions are stable (issue #112). Callers must size the session AND compressed range to clear the kernel's compress gates — see the tools.test.ts decompress-limit test. */
+export function buildShortTextSession(count: number): Session {
+  const session = Session.create('test-session')
+  appendTurn(session, 1)
+  for (let index = 0; index < count; index += 1) {
+    const line = `short line ${String(index).padStart(3, '0')} ${'abcdefghijklmnopqrstuvwxyz0123456789'.repeat(2)}`
+    if (index % 2 === 0) appendUser(session, line)
+    else appendAssistant(session, line, 1, index)
+  }
+  return session
+}
+
+/**
+ * A kernel range view that offers the WHOLE surface as one span.
+ *
+ * Production feeds the range table the kernel's own `compressibleRanges`
+ * (translated to surface seqs through the same view type). These tests target
+ * the FILTER layer on top of that geometry — instruction barriers, the
+ * protected tail, checkpoints, the system node — so one spanning range isolates
+ * it from how the kernel happens to group messages. The ref→seq mapping and the
+ * kernel grouping have their own test (region.test.ts, kernel range source).
+ *
+ * The ref names are arbitrary: only the mapping through `refs.byRef` matters.
+ */
+export function wholeSurfaceRangeView(
+  session: Session,
+): { ranges: { startRef: string; endRef: string }[]; refs: { byRef: Record<string, string> } } {
+  const nodes = session.surface.nodes
+  const first = nodes[0]
+  const last = nodes[nodes.length - 1]
+  if (first === undefined || last === undefined) return { ranges: [], refs: { byRef: {} } }
+  return {
+    ranges: [{ startRef: 'm00001', endRef: 'm00002' }],
+    refs: { byRef: { m00001: String(first), m00002: String(last) } },
+  }
 }

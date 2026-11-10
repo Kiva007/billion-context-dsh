@@ -17,7 +17,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { AcpStateStore } from './state.ts'
 import { kernelConfigFor, type KernelConfigInput } from './config.ts'
 import { resolveTokenCount } from './nudge.ts'
-import type { AcpWindow } from './window.ts'
+import { routeFor, type AcpWindow } from './window.ts'
 import {
   AlreadyCompressedRangeError,
   blockIdOfKernelRef,
@@ -25,23 +25,34 @@ import {
   blockRegistry,
   compactionIdsOfKernelBlocks,
   expandShadowedSeqs,
+  guardedSurfaceSeqsOf,
+  isExactSurfaceSpan,
   rebuildBlockLedger,
   resolveSurfaceRange,
   runCompactionTransaction,
+  liveCheckpointCarriersInSpan,
   shadowedSeqsOf,
   stripOrphanedSurfaceToolMessages,
+  summarySeqOfKernelBlock,
   openToolCallIds,
+  sliceDecompressPage,
   surfaceSummary,
+  DEFAULT_DECOMPRESS_PAGE,
+  DEFAULT_DECOMPRESS_PAGE_CHARS,
   type ResolvedSurfaceRange,
 } from './region.ts'
-import { allLogMessages, buildToolCallIndex, eventsToCoreMessages, extractEventText, surfaceEventsOf } from './messages.ts'
+import { allLogMessages, attachmentsOfEvent, buildToolCallIndex, eventsToCoreMessages, extractEventText, isAgentInstructionsRow, isCheckpointNode, isRealUserTurn, isSkillCatalogRow, surfaceEventsOf, toolCallsOf } from './messages.ts'
 import { shadowedTokensViaMeter } from './host-tokens.ts'
 import { eventAtOf, sessionEventsOf } from './session-events.ts'
 import { DEFAULT_RESOLVED, type ResolvedPrompts } from './prompts.ts'
+import type { SettingsCommandSurface } from './settings.ts'
+import type { PresetName } from './presets.ts'
 
 export interface ToolEnvironment extends KernelConfigInput {
   readonly kernel: CompressionCore
   readonly store: AcpStateStore
+  /** Display-only: the named preset that produced the nudge thresholds above, if any (`/acp-prune status` names it). Never read by the kernel path. */
+  readonly preset?: PresetName
   /** Resolve the effective context window for an agent (optional: status falls back to modelContextLimit). */
   readonly windowFor?: (agent: Agent) => Promise<AcpWindow>
   /** Resolved prompt templates (optional: falls back to DEFAULT_RESOLVED). */
@@ -53,6 +64,12 @@ export interface ToolEnvironment extends KernelConfigInput {
    * (strict providers reject that sequence with HTTP 400).
    */
   readonly compressCallIdsToHide?: Set<string>
+  /**
+   * Read/write access to the runtime settings layer for `/acp-prune config`.
+   * Absent surfaces (never expected — the engine always builds one) would
+   * degrade the command to advice text.
+   */
+  readonly settingsCommand?: SettingsCommandSurface
 }
 
 interface TextOutput {
@@ -84,7 +101,7 @@ function requireAgent(exec: ToolRunContext): Agent {
  * Resolve the effective context window for a tool or command run: probe the
  * agent's real window via `windowFor` when provided, otherwise fall back to
  * the environment's `modelContextLimit`. Shared by the compress and
- * acp_status tool handlers and the `/acp` command so the resolution logic
+ * acp_status tool handlers and the `/acp-prune` command so the resolution logic
  * lives in exactly one place (issue #63 — the tools used the 128K fallback
  * for pressure decisions even when auto-detection had found a larger window).
  */
@@ -94,7 +111,7 @@ export async function resolveEffectiveWindow(env: ToolEnvironment, agent: Agent)
     : await env.windowFor(agent)
 }
 
-const compressParameters = {
+export const compressParameters = {
   // Tolerated wrapped-arguments form: some models emit
   // `{ "arguments": "{\"content\": [...]}" }` (double-nested) or
   // `{ "arguments": { "content": [...] } }` instead of the unwrapped
@@ -128,18 +145,31 @@ const compressParameters = {
           required: true,
           oneOf: [
             { type: 'integer' as const, description: 'First surface seq of the range.' },
-            { type: 'string' as const, description: 'Seq as text; a trailing #callId fragment is ignored.' },
+            { type: 'string' as const, description: 'Seq as text; a trailing #callId fragment is ignored. A drilldown mN ref ("m00306") or a kernel block id ("b1", as acp_status lists) is also accepted — a block id resolves to that block\'s checkpoint seq, which makes the fold a tier 2/3 distillation.' },
           ],
         },
         endSeq: {
           required: true,
           oneOf: [
             { type: 'integer' as const, description: 'Inclusive last surface seq of the range.' },
-            { type: 'string' as const, description: 'Seq as text; a trailing #callId fragment is ignored.' },
+            { type: 'string' as const, description: 'Seq as text; a trailing #callId fragment is ignored. Also accepts a drilldown mN ref or a kernel block id ("b3") — for a multi-block condense name the LAST block id (tier 3).' },
           ],
         },
         summary: { type: 'string' as const, required: true, description: 'Complete technical summary replacing the range; keep paths, decisions, values verbatim. Minimum 50 characters.' },
         topic: { type: 'string' as const, description: 'Short label (3-5 words) for this range.' },
+        // B3 (2026-09-08 governance plan): the handler and region.ts have
+        // accepted verifiedReadings since the plan landed, but the declared
+        // parameter schema did not list it — `additionalProperties: false`
+        // then rejected every live call that carried it
+        // (`invalid arguments: "content[0].verifiedReadings" is not a declared
+        // property`), so the structured-loss-stopping field was unreachable
+        // from the model's tool interface. Declared here; additionalProperties
+        // stays false so unknown fields are still rejected.
+        verifiedReadings: {
+          type: 'array' as const,
+          items: { type: 'string' as const },
+          description: 'Optional: acceptance readings that are already green before this compression (e.g. "t0-fastpath 8/8", "closedloop 414/414"). Stored structurally on the compaction/summary event and recovered by verifiedReadingsOf, so later steps need not re-run the checks.',
+        },
       },
       additionalProperties: false,
     },
@@ -158,16 +188,27 @@ function parseSeq(value: number | string): number {
 
 /**
  * Match a drilldown mN ref: "m00306" / "m306" (kernel `refToIndex` semantics,
- * `m0*(\d{1,5})`), tolerating a trailing `#callId` fragment (symmetric with
+ * `m0*(\d{1,7})`), tolerating a trailing `#callId` fragment (symmetric with
  * `parseSeq`'s `#` handling). Returns the ref index, or null for non-mN input.
+ *
+ * The width AND the bound mirror the kernel's `REF_PATTERN` / `MAX_INDEX`
+ * (0.0.101: `\d{1,7}` and `9999999`; through 0.0.63 both were 5 digits /
+ * `99999`). They must be re-checked on every kernel bump (AGENTS.md §4b): a
+ * session numbers refs upward and never reuses one, so once it outgrows the
+ * old width the kernel keeps handing out `m100000`+ — and a host parser capped
+ * at 5 digits rejects acp_status's OWN rows as "not a ref", in exactly the long
+ * sessions a ref-width bump exists to rescue. `tests/tools.test.ts` round-trips
+ * the kernel's `indexToRef` boundaries, so a future widening turns that test
+ * red instead of degrading silently.
  */
-const MN_RE = /^m0*(\d{1,5})(?:#.*)?$/i
+const MN_RE = /^m0*(\d{1,7})(?:#.*)?$/i
 
-function mnRefIndex(value: string): number | null {
+/** Exported so the ref-width contract test can pin it without a 100K-message fixture. */
+export function mnRefIndex(value: string): number | null {
   const match = MN_RE.exec(value.trim())
   if (match === null) return null
   const index = Number(match[1])
-  return index >= 1 && index <= 99999 ? index : null
+  return index >= 1 && index <= 9999999 ? index : null
 }
 
 /**
@@ -177,7 +218,18 @@ function mnRefIndex(value: string): number | null {
  *    turn's `messageRefs.byRef` (CoreMessage.id = seq or "seq#callId" → split
  *    on "#"). Unknown mN (never assigned on the current surface) fails with
  *    guidance; a valid mN whose span was already compressed falls through to
- *    the existing recover-stale / already-compressed semantics (rule 7).
+ *    the existing recover-stale / already-compressed semantics (rule 7);
+ *  - a kernel block ref ("b1") — the id `acp_status` prints per active block and
+ *    `decompress` already accepts — resolved to that block's checkpoint seq
+ *    (`summarySeqOfKernelBlock`). Naming the checkpoint node is what makes the
+ *    fold a tier 2/3 distillation: the resolver then sees the edge ON the
+ *    carrier, `blockRefForSummarySeq` hands the kernel the block ref back, and
+ *    `liveCheckpointCarriersInSpan`'s guard stands down (that guard exists to
+ *    refuse a PLAIN seq range swallowing a live carrier). Before this, the
+ *    reject note's own advice — "distill it with the block ids" — led to
+ *    `invalid seq "b1"`, i.e. the tool told the model to make a call no parser
+ *    accepted. A block id that is not an ACTIVE block (superseded, or never
+ *    existed) fails with guidance.
  * `byRef` MUST come from `turn.state.messageRefs` (after `processTurn`), not
  * the persisted store state: acp_status's turn is never persisted, so mN refs
  * shown in a drilldown (including refs for messages that arrived since the
@@ -185,8 +237,18 @@ function mnRefIndex(value: string): number | null {
  * against the stored state would report a false "unknown mN" and dead-loop
  * the model between acp_status and compress.
  */
-function parseBoundary(value: number | string, byRef: Record<string, string>): number {
-  const text = String(value)
+function parseBoundary(value: number | string, byRef: Record<string, string>, session: Session): number {
+  const text = String(value).trim()
+  if (/^b\d+$/.test(text)) {
+    const seq = summarySeqOfKernelBlock(session, text)
+    if (seq === null) {
+      throw new Error(
+        `billion-context-dsh: block "${text}" is not an active block — run acp_status for the live block ids `
+        + '(a block-id boundary distills that block, tier 2/3)',
+      )
+    }
+    return seq
+  }
   const index = mnRefIndex(text)
   if (index === null) return parseSeq(value)
   // Normalize to the kernel's padded key ("m00306") — byRef holds exact keys.
@@ -210,7 +272,7 @@ interface CompressArgs {
   /** Tolerated wrapped-arguments form (model-generated double-nesting). */
   arguments?: string | { content?: CompressArgs['content'] }
   topic?: string
-  content?: Array<{ startSeq: number | string; endSeq: number | string; summary: string; topic?: string }>
+  content?: Array<{ startSeq: number | string; endSeq: number | string; summary: string; topic?: string; verifiedReadings?: string[] }>
 }
 
 /**
@@ -289,7 +351,210 @@ function validateContentItems(content: NonNullable<CompressArgs['content']>): vo
   if (violations.length > 0) throw new ToolArgsError(violations)
 }
 
-/** Resolve seq → kernel ref, then applyCompression and land the transaction. */
+/**
+ * Pure gate helpers for the compress tool's CURRENT-instruction-row rejection.
+ *
+ * Decision history (issue #71 review): the first draft only WARNED when a
+ * manual compress range swallowed a current injected row (F7), because the
+ * compression is safe and self-healing. The owner reversed that during PR1
+ * review: compressing a CURRENT row has NO legitimate outcome — the host
+ * re-injects the newest AGENTS.md copy unconditionally the moment it leaves
+ * the surface (presence gate, deepseek-harness
+ * packages/context/agent-instructions/src/index.ts:137/:163), so the tokens
+ * come straight back and the call is pure waste — and a hard reject keeps the
+ * manual path consistent with the system-side GC's iron rule (PR2: never
+ * clear a group's newest row). STALE copies stay compressible: removing them
+ * while the newest stays visible is the actual cleanup and triggers no
+ * re-injection. Skill-catalog rows joined the guard set for a DIFFERENT
+ * reason (issue #185): they are not self-healing at all — the host resends
+ * the catalog only when its digest changes, so a folded catalog stays gone
+ * until the catalog actually changes. The range table
+ * (buildCompressibleSeqRanges) never offers these rows, so the gate only fires
+ * on hand-built ranges.
+ *
+ * `guardedRowsInSpan` is the overlap probe. It takes the POSITIONAL span the
+ * transaction will actually shadow (`shadowedSeqsOf`), never a numeric
+ * `start <= seq <= end` interval: the surface is locally non-monotonic after
+ * earlier replacements (a checkpoint seq spliced ahead of older residual
+ * nodes), so a tier-2 distill of two checkpoints can carry a CURRENT
+ * instruction row numerically inside its edges while the sliced span excludes
+ * it — the interval probe rejected exactly the call the nudge hands the model
+ * (issue #71 review B1). Probing the slice also keeps guard and effect in
+ * agreement: `shadowedSeqsOf` is what the transaction prices and
+ * `assertProvenance` verifies.
+ * `protectedRowRejectionNote` renders the rejection the model sees: it names
+ * the offending seqs AND the compressible slices left in the span, so the model
+ * can re-cut (or split into two calls) instead of retrying the same call.
+ * `guardedSurfaceSeqsOf` supplies the protected set.
+ */
+export function guardedRowsInSpan(guarded: ReadonlySet<number>, shadowed: readonly number[]): number[] {
+  const inSpan = new Set(shadowed)
+  return [...guarded].filter((seq) => inSpan.has(seq)).sort((a, b) => a - b)
+}
+
+/**
+ * Advisory note for a plain range that would fold a LIVE block's checkpoint
+ * carrier (see `liveCheckpointCarriersInSpan`). Names the block ids the model
+ * can use instead — a block-ref boundary is the call that legitimately folds
+ * carriers (tier 2/3 distillation).
+ */
+export function liveCarrierRejectionNote(
+  start: number,
+  end: number,
+  carriers: readonly { seq: number; kernelBlockId: string }[],
+): string {
+  const list = carriers.map((carrier) => `seq ${carrier.seq} (${carrier.kernelBlockId})`).join(', ')
+  const first = carriers[0]!
+  // Name the LAST carrier as the end edge too: a valid multi-carrier span is a
+  // tier-3 condense, and suggesting `b1..b1` would silently distill only the
+  // first parent.
+  const last = carriers[carriers.length - 1]!
+  return `  seqs ${start}..${end} rejected — checkpoint ${list} carries the visible summary of a still-active block, and a plain seq range never supersedes one. Distill it with the block ids instead (compress({ content: [{ startSeq: "${first.kernelBlockId}", endSeq: "${last.kernelBlockId}", summary }] })), or cut the span around those seqs.`
+}
+
+export function protectedRowRejectionNote(
+  start: number,
+  end: number,
+  hits: readonly number[],
+  shadowed: readonly number[],
+  session?: Session,
+): string {
+  const preview = hits.slice(0, 4).join(', ')
+  const more = hits.length > 4 ? ` +${hits.length - 4} more` : ''
+  const first = shadowed.indexOf(hits[0]!)
+  const last = shadowed.indexOf(hits[hits.length - 1]!)
+  const before = first > 0 ? shadowed.slice(0, first) : []
+  const after = last >= 0 && last < shadowed.length - 1 ? shadowed.slice(last + 1) : []
+  const slices = [before, after]
+    .filter((slice) => slice.length > 0)
+    .map((slice) => `${slice[0]}..${slice[slice.length - 1]}`)
+  const recovery = slices.length === 0
+    ? 'no part of this span is compressible while those rows are current — pick an OLDER span instead (acp_status lists the live ranges)'
+    : `the compressible part of this span is seq ${slices.join(' and ')} — submit them as separate content entries (or two compress calls), each with its own summary`
+  // Why the guarded rows may not be folded, per channel. Without a session the
+  // hits cannot be classified, so the wording stays the instruction-only text
+  // this note has always carried (pinned by tests).
+  let hasInstructions = false
+  let hasCatalog = false
+  let hasUserTurn = false
+  if (session !== undefined) {
+    for (const seq of hits) {
+      const event = eventAtOf(session, seq)
+      if (event === undefined) continue
+      if (!hasInstructions && isAgentInstructionsRow(event)) hasInstructions = true
+      if (!hasCatalog && isSkillCatalogRow(event)) hasCatalog = true
+      if (!hasUserTurn && isRealUserTurn(event)) hasUserTurn = true
+      if (hasInstructions && hasCatalog && hasUserTurn) break
+    }
+  }
+  const reasons: string[] = []
+  if (session === undefined) {
+    reasons.push('the host re-injects the newest AGENTS.md copy the moment it leaves the surface, so compressing it reclaims nothing')
+  } else if (!hasInstructions && !hasCatalog && !hasUserTurn) {
+    // A session that identifies none of the hits must NOT claim an AGENTS.md
+    // re-injection it cannot confirm: the rows stay guarded, the mechanism
+    // stays unnamed.
+    reasons.push('these rows must stay visible on the surface')
+  } else {
+    // Per-channel WHY (issue #185): the guarded channels fail differently when
+    // folded — AGENTS.md comes straight back (host presence gate); a skill
+    // catalog never does (resend keyed on the catalog digest, not visibility);
+    // and the active user turn would vanish from the surface entirely.
+    if (hasInstructions) {
+      reasons.push('the host re-injects the newest AGENTS.md copy the moment it leaves the surface, so compressing it reclaims nothing')
+    }
+    if (hasCatalog) {
+      reasons.push('a folded skill catalog is never re-sent — its resend gate is the catalog digest, which folding cannot change')
+    }
+    if (hasUserTurn) {
+      reasons.push('the active user message must stay live to preserve conversation intent')
+    }
+  }
+  // A hit set that is ONLY the active user turn must not be explained with the
+  // AGENTS.md re-injection story (or its stale-copy escape): neither applies to
+  // a user message. `guardedSurfaceSeqsOf` may also protect the newest real user
+  // turn alongside the policy rows, hence the two labels.
+  const userOnly = hasUserTurn && !hasInstructions && !hasCatalog
+  const rowLabel = hasUserTurn ? 'CURRENT guarded row(s)' : 'CURRENT injected instruction row(s)'
+  const staleCopyTail = userOnly ? '' : ' (older/stale copies of the same channel are fine to compress)'
+  return `  seqs ${start}..${end} rejected — the span covers ${hits.length} ${rowLabel} (seq ${preview}${more}); ${reasons.join('; ')} — ${recovery}${staleCopyTail}`
+}
+
+/**
+ * Kernel ref for one RESOLVED range edge's surface node (issue #155).
+ * Resolved edges are tool-pairing-balanced and anchorable, but NO LONGER
+ * guaranteed to carry a bare-`${seq}` ref: a multi-tool-call assistant
+ * projects to `${seq}#${callId}` sub-ids, and an empty tool result projects
+ * to nothing. Three tiers, in order:
+ *
+ *  1. the bare-seq id (user turns, single-call assistants, text-bearing results);
+ *  2. the node's sub-ids in projection (= content) order — FIRST for a start
+ *     edge (the kernel must consume the whole node from its first sub-message),
+ *     LAST for an end edge (unreachable in practice: a node with open calls
+ *     makes every cut after it unbalanced, so it can never be a resolved end
+ *     edge);
+ *  3. the nearest message-bearing LIVE node between this edge and the opposite
+ *     edge (inclusive), walked along the SURFACE — never raw-id space, where
+ *     shadowed nodes keep their refs and would anchor onto already-compressed
+ *     messages. Walking inward only also guarantees the returned ref names a
+ *     message the transaction actually shadows; a span whose interior carries
+ *     no message at all (two adjacent empty results) yields undefined and the
+ *     caller raises the existing "no assigned ref" error.
+ */
+export function edgeRefForSeq(
+  session: Session,
+  byRaw: Readonly<Record<string, string>>,
+  seq: number,
+  role: 'start' | 'end',
+  oppositeSeq: number,
+): string | undefined {
+  const nodes = session.surface.nodes
+  let index = -1
+  let oppositeIndex = -1
+  for (let i = 0; i < nodes.length; i += 1) {
+    if (nodes[i] === seq) index = i
+    if (nodes[i] === oppositeSeq) oppositeIndex = i
+  }
+  if (index < 0 || oppositeIndex < 0) return undefined
+  const direct = anchorRefForNode(session, byRaw, seq, role)
+  if (direct !== undefined) return direct
+  const step = role === 'start' ? 1 : -1
+  // Walk from just past this edge toward the opposite edge, INCLUSIVE of it:
+  // the opposite edge's own ref is a legitimate answer when nothing in between
+  // carries one (e.g. [empty result, text result]).
+  for (let i = index + step; i !== oppositeIndex + step; i += step) {
+    const ref = anchorRefForNode(session, byRaw, nodes[i]!, role)
+    if (ref !== undefined) return ref
+  }
+  return undefined
+}
+
+/** Bare-seq ref for one node, else its multi-call sub-id ref (see edgeRefForSeq). */
+function anchorRefForNode(
+  session: Session,
+  byRaw: Readonly<Record<string, string>>,
+  seq: number,
+  role: 'start' | 'end',
+): string | undefined {
+  const direct = byRaw[String(seq)]
+  if (direct !== undefined) return direct
+  const event = eventAtOf(session, seq)
+  if (event?.type !== 'assistant/message') return undefined
+  const content = (event.data as { message?: { content?: unknown } }).message?.content
+  // The projection emits one sub-message PER CALL, including calls whose id is
+  // absent (keyed `${seq}#`), so the gate must mirror that trigger exactly:
+  // fewer than 2 calls means this node projected to a bare seq (tier 1 above).
+  const ids = toolCallsOf(content).map((call) => call.id ?? '')
+  if (ids.length < 2) return undefined
+  // Projection order IS content order (projectEvent maps the calls in sequence).
+  const ordered = role === 'start' ? ids : [...ids].reverse()
+  for (const id of ordered) {
+    const ref = byRaw[`${seq}#${id}`]
+    if (ref !== undefined) return ref
+  }
+  return undefined
+}
+
 async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: ToolRunContext): Promise<TextOutput> {
   const agent = requireAgent(exec)
   const session = agent.session
@@ -344,23 +609,43 @@ async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: To
       endRef: string
       summary: string
       topic?: string
+      /** B3：本段压缩时已绿的验收读数（结构化落盘）。 */
+      verifiedReadings?: string[]
     }
   > = []
   // Ranges whose whole span was already shadowed by earlier compressions.
   // They land as advisory warnings, never as errors or phantom blocks.
   const alreadyCompressedNotes: string[] = []
+  // Ranges rejected because they cover a CURRENT injected instruction row —
+  // hard reject before the kernel apply (supersedes the F7 warn-only draft,
+  // see protectedRowRejectionNote): the kernel never sees these ranges, so no
+  // phantom block can exist. Computed once here: the surface is stable from
+  // the orphan strip onward, the deferred compress-pair hide only touches tool
+  // events, and every accepted range lands in ONE applyCompression call at the
+  // end of the loop — so the set cannot go stale mid-batch.
+  const rejectedNotes: string[] = []
+  // Range keys (`startRef::endRef`) already claimed by an accepted range in
+  // THIS call: several requested ranges can resolve to ONE balanced span
+  // (single tool results expand outward to the enclosing pair), and feeding
+  // the same span twice makes the kernel stamp a block per request while only
+  // one durable transaction can ever land for it (issue #201).
+  const seenRangeKeys = new Set<string>()
+  const duplicateRangeNotes: string[] = []
+  const guardedSeqs = guardedSurfaceSeqsOf(session)
   for (const range of args.content!) {
-    const startSeq = parseBoundary(range.startSeq, byRef)
-    const endSeq = parseBoundary(range.endSeq, byRef)
+    const startSeq = parseBoundary(range.startSeq, byRef, session)
+    const endSeq = parseBoundary(range.endSeq, byRef, session)
     let resolved: ResolvedSurfaceRange
     try {
-      // Balance edges FIRST: the requested edges may sit on multi-tool-call
-      // assistant messages, which project to `${seq}#${callId}` CoreMessage ids
-      // and therefore have NO bare-`${seq}` ref. resolveSurfaceRange shifts them
-      // to clean tool-pairing-balanced cuts that always carry a bare ref, so the
-      // resolved refs exist and the shadowed span matches the returned range.
-      // Edges shadowed by an earlier compression (stale nudge table / old
-      // compress result) are remapped to the still-live content of the span.
+      // Balance edges FIRST: the requested edges may sit mid-pair or on nodes
+      // that project no bare-`${seq}` id (multi-tool-call assistants project to
+      // `${seq}#${callId}` sub-ids; empty tool results project to nothing —
+      // issue #155). resolveSurfaceRange shifts them to clean
+      // tool-pairing-balanced cuts that ANCHOR (bare ref, sub-id, or the
+      // empty-result fallback — see edgeRefForSeq), so the resolved refs exist
+      // and the shadowed span matches the returned range. Edges shadowed by an
+      // earlier compression (stale nudge table / old compress result) are
+      // remapped to the still-live content of the span.
       resolved = resolveSurfaceRange(session, startSeq, endSeq)
     } catch (error) {
       if (error instanceof AlreadyCompressedRangeError) {
@@ -375,35 +660,87 @@ async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: To
       }
       throw error
     }
+    // Hard reject BEFORE the kernel: a span covering a CURRENT injected policy
+    // row has no legitimate outcome — the host re-injects the newest AGENTS.md
+    // copy the moment it leaves the surface (compress → re-inject loop fuel,
+    // issue #71), and a folded skill catalog never comes back at all (resend
+    // keyed on the digest, issue #185). Stale copies pass: removing them while
+    // the newest stays visible is the real cleanup and triggers no re-injection.
+    // Probe the set that will ACTUALLY be shadowed (`shadowedSeqsOf`, the
+    // positional slice the transaction prices) rather than a numeric interval —
+    // see guardedRowsInSpan for why the interval false-positives on a locally
+    // non-monotonic surface.
+    const shadowedSpan = shadowedSeqsOf(session, resolved.start, resolved.end)
+    const instructionHits = guardedRowsInSpan(guardedSeqs, shadowedSpan)
+    if (instructionHits.length > 0) {
+      rejectedNotes.push(protectedRowRejectionNote(resolved.start, resolved.end, instructionHits, shadowedSpan, session))
+      continue
+    }
     // An edge on an ACTIVE block's checkpoint summary node resolves to the
     // kernel block ref (bN) — the boundary that makes applyCompression distill
     // (tier 2/3) instead of folding the summary as a plain message.
     const startBlockRef = blockRefForSummarySeq(session, resolved.start)
     const endBlockRef = blockRefForSummarySeq(session, resolved.end)
-    const startRef = startBlockRef ?? byRaw[String(resolved.start)]
-    const endRef = endBlockRef ?? byRaw[String(resolved.end)]
+    const startRef = startBlockRef ?? edgeRefForSeq(session, byRaw, resolved.start, 'start', resolved.end)
+    const endRef = endBlockRef ?? edgeRefForSeq(session, byRaw, resolved.end, 'end', resolved.start)
     if (startRef === undefined || endRef === undefined) {
       throw new Error(
         `billion-context-dsh: seq ${resolved.start}..${resolved.end} has no assigned ref — `
         + 'the range must be on the current surface (run acp_status for the live seq list)',
       )
     }
+    // A plain (message-ref) range must not fold a LIVE block's checkpoint
+    // carrier. The kernel keeps that carrier visible — our projection marks it
+    // via `summaryOfBlockId`, upstream #335 — but this host transaction replaces
+    // the WHOLE span in one `surfaceOp`, so the carrier would leave the surface
+    // anyway: the block's summary would vanish while the kernel still counts the
+    // block as active. Block-ref boundaries (bN..bM) are the call that SHOULD
+    // fold carriers (tier 2/3), so the reject fires only when NEITHER edge is a
+    // block ref — the same rule the kernel applies (`resolveBoundaries` reports
+    // boundary kind `block` as soon as one edge is a block ref).
+    if (startBlockRef == null && endBlockRef == null) {
+      const carriers = liveCheckpointCarriersInSpan(session, shadowedSpan)
+      if (carriers.length > 0) {
+        rejectedNotes.push(liveCarrierRejectionNote(resolved.start, resolved.end, carriers))
+        continue
+      }
+    }
+    const rangeKey = `${startRef}::${endRef}`
+    if (seenRangeKeys.has(rangeKey)) {
+      // An earlier range in this call already owns this exact span: its summary
+      // lands for the whole span, and a second block here could never get its
+      // own durable transaction (the span leaves the surface after the first).
+      duplicateRangeNotes.push(
+        `  seqs ${range.startSeq}..${range.endSeq} resolve to the same span as an earlier range in this call (${resolved.start}..${resolved.end}) — skipped`,
+      )
+      continue
+    }
+    seenRangeKeys.add(rangeKey)
     ranges.push({
       ...resolved,
       startSeq,
       endSeq,
       startRef,
       endRef,
+      // B3：把该段声明的已绿验收读数带上（缺位=不写键）
+      ...(Array.isArray(range.verifiedReadings) && range.verifiedReadings.length > 0
+        ? { verifiedReadings: range.verifiedReadings.map(String) }
+        : {}),
       summary: range.summary,
       ...(range.topic ?? args.topic) === undefined ? {} : { topic: range.topic ?? args.topic },
     })
   }
 
-  // Nothing to do: every requested range was already compressed.
+  // Nothing to do: every requested range was already compressed, rejected, or
+  // a duplicate of an earlier range in the same call.
   if (ranges.length === 0) {
-    const text = ['Compressed 0 block(s), ~0 tokens reclaimed.', ...alreadyCompressedNotes]
+    const text = ['Compressed 0 block(s), ~0 tokens reclaimed.', ...alreadyCompressedNotes, ...duplicateRangeNotes, ...rejectedNotes]
     if (alreadyCompressedNotes.length > 0) {
       text.push('  (all requested ranges were already compressed — decompress a block to recover its originals)')
+    } else if (duplicateRangeNotes.length > 0 && rejectedNotes.length === 0) {
+      text.push('  (nothing compressed — every range resolved to a span an earlier range in this call already covers)')
+    } else if (rejectedNotes.length > 0) {
+      text.push('  (nothing compressed — every range covered a current guarded row, an injected policy row or the active user turn; see the rejections above)')
     }
     return { text: text.join('\n') }
   }
@@ -475,20 +812,36 @@ async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: To
     // The edges were already balanced above; shadow exactly that span.
     const { start, end } = range
     const shadowed = shadowedSeqsOf(session, start, end)
+    // Last line of defense before the durable write: if an earlier landed
+    // transaction in this batch removed this span from the surface (the kernel
+    // can stamp one block per requested range even when several share refs),
+    // skip instead of transacting — a summary whose shadowedSeqs no longer
+    // name an exact current surface span bricks the session log on next load
+    // (issue #201). runCompactionTransaction re-validates and would throw;
+    // skipping keeps the rest of the batch landing.
+    if (!isExactSurfaceSpan(session, start, end, shadowed)) {
+      skippedRanges += 1
+      lines.push(`  skipped seqs ${start}..${end}: already shadowed by an earlier range in this call`)
+      continue
+    }
     // Price the reclaimed tokens in the HOST's token vocabulary (rule 12):
     // prefer the live meter's per-node prices, fall back to the exact mirror.
     // NEVER defaultCountTokens — that overdraws the meter on CJK (issue #54).
     const shadowedTokens = shadowedTokensViaMeter(session, shadowed, agent.ctx)
     const tier = block.tier === 2 || block.tier === 3 ? block.tier : 1
     const parentBlockIds = compactionIdsOfKernelBlocks(session, block.directBlockIds)
+    // Provenance follows the LIVE route, not `agent.options`: after a mid-session
+    // model switch the latter is a stale snapshot (the PREVIOUS route), so the
+    // summary node would be stamped with a route the summary did not come from.
+    const { provider, model } = routeFor(agent)
     const { compactionId } = runCompactionTransaction(session, {
       start,
       end,
       shadowedSeqs: shadowed,
       summary: [{ type: 'text', text: range.summary }],
       shadowedTokenCount: shadowedTokens,
-      provider: agent.options.provider ?? '',
-      model: agent.options.model ?? '',
+      provider,
+      model,
       tier,
       kernelBlockId: block.blockId,
       ...(range.topic === undefined ? {} : { topic: range.topic }),
@@ -498,6 +851,8 @@ async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: To
       // its parents' originals, not the checkpoint node).
       directMessageIds: block.directMessageIds,
       effectiveMessageIds: block.effectiveMessageIds,
+      // B3：已绿验收读数随压缩块落盘（缺位=不写键）
+      ...(range.verifiedReadings === undefined ? {} : { verifiedReadings: range.verifiedReadings }),
     })
     const adjusted = start !== range.startSeq || end !== range.endSeq
     // Always report the tier, even tier 1: a silently-downgraded distill
@@ -505,20 +860,33 @@ async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: To
     // message) must be visible to the model immediately, or the model keeps
     // believing the distillation landed (issue #60, failure mode 2).
     const tierLabel = `, tier ${tier}`
+    // B3 must be READABLE, not just durable: echo the recorded readings back in the
+    // compress result, otherwise "later steps need not re-run them" is unreachable
+    // (the field had no other production reader).
+    const readingsLabel = range.verifiedReadings !== undefined && range.verifiedReadings.length > 0
+      ? `, verified: ${range.verifiedReadings.join('; ')}`
+      : ''
     const note = range.recovered === true
       ? ` (seqs ${range.startSeq}..${range.endSeq} were already shadowed — compressed the live remainder ${start}..${end})`
       : adjusted
         ? ` (adjusted from ${range.startSeq}..${range.endSeq} to balanced edges)`
         : ''
     lines.push(
-      `  block ${compactionId.slice(0, 8)}: seqs ${start}..${end}, ${shadowed.length} messages shadowed${tierLabel}${note}`,
+      `  block ${compactionId.slice(0, 8)}: seqs ${start}..${end}, ${shadowed.length} messages shadowed${tierLabel}${readingsLabel}${note}`,
     )
   }
 
   const summaryLine = `Compressed ${applied.result.blocksCreated} block(s), ~${applied.result.tokensCompressed} tokens reclaimed.`
-  const totalSkipped = skippedRanges + alreadyCompressedNotes.length
+  const totalSkipped = skippedRanges + alreadyCompressedNotes.length + duplicateRangeNotes.length + rejectedNotes.length
   const failedLines = applied.result.errors.map((error) => `  ${error}`)
-  const warningLines = [...freeWarnings.map((warning) => `  ${warning}`), ...failedLines, ...alreadyCompressedNotes, ...lines]
+  const warningLines = [
+    ...freeWarnings.map((warning) => `  ${warning}`),
+    ...failedLines,
+    ...alreadyCompressedNotes,
+    ...duplicateRangeNotes,
+    ...rejectedNotes,
+    ...lines,
+  ]
   const footer = totalSkipped > 0
     ? `  (${totalSkipped} range(s) skipped or failed — see above)`
     : ''
@@ -527,15 +895,19 @@ async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: To
 
 const decompressParameters = {
   blockId: { type: 'string' as const, required: true, description: 'Block id: the kernel block ref `bN` shown by acp_status (e.g. b1), or a compaction id / prefix from search_context.' },
+  offset: { type: 'integer' as const, description: 'Start position in the block\'s message list (default 0). Blocks are paged by size — each page stays under the host tool-result trim budget (up to 100 messages) — so follow the continue hint in the result to walk the rest.' },
+  limit: { type: 'integer' as const, description: 'Messages per page (default 100; values above 100 are capped to 100). Pages are also bounded by a character budget, so long messages return fewer than this per call.' },
 } as const
 
 interface DecompressArgs {
   blockId: string
+  offset?: number
+  limit?: number
 }
 
 /** Resolve a block arg to its durable compaction id: exact `bN` kernel ref
  *  first (acp_status shows `bN`), then the compaction-id prefix match that
- *  search_context and /acp have always used. The `bN` branch is exact
+ *  search_context and /acp-prune have always used. The `bN` branch is exact
  *  (`/^b\d+$/` with `$`), so a UUID that happens to start with `b1` cannot be
  *  shadowed — full UUIDs and 8-char prefixes never match the anchored regex. */
 function resolveBlockId(session: Session, arg: string): string | null {
@@ -558,16 +930,41 @@ function handleDecompress(_env: ToolEnvironment, rawArgs: DecompressArgs, exec: 
   if (block === undefined) {
     return { text: `decompress: block "${args.blockId}" not found (see acp_status for the block list)` }
   }
-  const parts: string[] = []
   // Tier-2/3 blocks shadow parent checkpoint nodes: expand to the originals.
-  for (const seq of expandShadowedSeqs(session, block.blockId)) {
+  // Page by BOTH message count and rendered chars so a normal page stays under
+  // the host's tool-result pruner threshold (DEFAULT_DECOMPRESS_PAGE_CHARS);
+  // renderLen prices each message exactly as it will appear on this page.
+  const expanded = expandShadowedSeqs(session, block.blockId)
+  const page = sliceDecompressPage(
+    expanded,
+    args.offset ?? 0,
+    args.limit ?? DEFAULT_DECOMPRESS_PAGE,
+    DEFAULT_DECOMPRESS_PAGE_CHARS,
+    (seq) => {
+      const event = eventAtOf(session, seq)
+      const text = event === undefined ? '' : extractEventText(event)
+      return text.length === 0 ? 0 : `[seq ${seq}] ${text}`.length
+    },
+  )
+  if (page.total === 0 || page.seqs.length === 0) {
+    const where = page.total === 0 ? '' : ` has ${page.total} messages; offset ${page.offset} is past the end — use an offset below ${page.total}, or omit it`
+    return { text: page.total === 0 ? `Block ${block.blockId} — ${block.summary}\n\n(no recoverable content)` : `decompress: block ${block.blockId}${where}` }
+  }
+  const parts: string[] = []
+  for (const seq of page.seqs) {
     const event = eventAtOf(session, seq)
     const text = event === undefined ? '' : extractEventText(event)
     if (text.length > 0) parts.push(`[seq ${seq}] ${text}`)
   }
   const tierNote = block.tier > 1 ? ` (tier ${block.tier}, distills ${block.parentBlockIds.length} block(s))` : ''
+  // Marker + continue hint LEAD the payload, not trail it: if a page is ever
+  // oversized and the host drops its middle, the "this page is partial" line
+  // survives up top rather than being the exact line that gets trimmed away.
+  const lines: string[] = []
+  lines.push(`[messages ${page.offset + 1}..${page.offset + page.seqs.length} of ${page.total}]`)
+  if (!page.exhausted) lines.push(`More available — continue with decompress({ blockId: "${block.blockId}", offset: ${page.offset + page.seqs.length} })`)
   return {
-    text: `Block ${block.blockId} — ${block.summary}${tierNote}\n\n${parts.join('\n\n') || '(no recoverable content)'}`,
+    text: `Block ${block.blockId} — ${block.summary}${tierNote}\n\n${lines.join('\n')}\n\n${parts.join('\n\n') || '(no text content on this page)'}`,
   }
 }
 
@@ -591,15 +988,27 @@ function roleOfEvent(event: SessionEvent): MessageRole | null {
   }
 }
 
+// The search corpus (block summaries + all shadowed originals) is a pure
+// function of the append-only log: rebuild it once per log snapshot and reuse
+// across searches until the next append (issue #133 — the per-call full
+// rebuild re-extracted and re-counted every shadowed message on every search;
+// the snapshot array is stable until the next append, see sessionEventsOf).
+const searchDocsCache = new WeakMap<readonly SessionEvent[], SearchDoc[]>()
+
 /**
  * Build the unified SearchDoc[] from the log: one block doc per ledger entry
  * (ref = compactionId, so `decompress({ blockId })` closes the loop) plus one
  * message doc per shadowed ORIGINAL (expanded through distilled parents; each
  * seq is claimed by the earliest/innermost block that covered it, mirroring
  * pi's owner map — decompress on that block recovers the original).
+ * Cached per log snapshot (see searchDocsCache). Exported for the issue #133
+ * regression tests (not part of the public API — index.ts re-exports only).
  */
-function buildSearchDocs(session: Session): SearchDoc[] {
-  const ledger = rebuildBlockLedger(sessionEventsOf(session))
+export function buildSearchDocs(session: Session): SearchDoc[] {
+  const events = sessionEventsOf(session)
+  const cached = searchDocsCache.get(events)
+  if (cached !== undefined) return cached
+  const ledger = rebuildBlockLedger(events)
   const docs: SearchDoc[] = []
   const claimed = new Set<number>()
   for (const block of ledger) {
@@ -632,6 +1041,7 @@ function buildSearchDocs(session: Session): SearchDoc[] {
       })
     }
   }
+  searchDocsCache.set(events, docs)
   return docs
 }
 
@@ -696,16 +1106,6 @@ interface StatusArgs {
   limit?: number
 }
 
-/** A compaction checkpoint summary node (`source.plugin === 'compact'`). These
- *  are NOT in any block's `effectiveMessageIds`, so feeding them to
- *  `buildStatusReport` would double-count the summary — once as `block.summary`
- *  (summaryTokens) and once as a visible text message (totalText). Excluded
- *  before status rendering (design §4.2 P1-3). */
-function isCheckpointEvent(event: SessionEvent): boolean {
-  if (event.type !== 'user/message') return false
-  const source = (event.data as { source?: { plugin?: string } }).source
-  return source?.plugin === 'compact'
-}
 
 async function handleStatus(env: ToolEnvironment, rawArgs: StatusArgs, exec: ToolRunContext): Promise<TextOutput> {
   // The model channel may wrap ANY tool's args under `{ arguments: {…} }`;
@@ -732,7 +1132,7 @@ async function handleStatus(env: ToolEnvironment, rawArgs: StatusArgs, exec: Too
   const turn = env.kernel.processTurn({ messages: coreMessages, state, config, tokenCount })
   // Status messages = visible surface EXCLUDING checkpoint summary nodes (P1-3).
   const statusMessages = eventsToCoreMessages(
-    surface.filter((event) => !isCheckpointEvent(event)),
+    surface.filter((event) => isCheckpointNode(event) === false),
     toolNames,
   )
   // Upstream-aligned: the kernel renders the breakdown (percentages of the
@@ -762,6 +1162,23 @@ async function handleStatus(env: ToolEnvironment, rawArgs: StatusArgs, exec: Too
       .map((entry) => `${entry.kernelBlockId} → seq ${entry.summarySeq}`)
     if (checkpointRows.length > 0) {
       lines.push('', `Checkpoint seqs (active blocks — compress a checkpoint seq to distill it): ${checkpointRows.join(', ')}`)
+    }
+    // Two calibers meet in this report: the pressure/nudge line is
+    // provider-anchored (the session projection, where images and files carry
+    // the live route's price) while the breakdown above is a text-only
+    // estimate. They legitimately disagree on media-heavy sessions, and a model
+    // reads that disagreement as a broken number unless it is told which is
+    // which (issue #117). Emitted only when the surface actually carries media,
+    // so a text-only session keeps the kernel report untouched.
+    const mediaOnSurface = surface.some((event) => {
+      const counts = attachmentsOfEvent(event)
+      return counts.images + counts.files > 0
+    })
+    if (mediaOnSurface) {
+      lines.push(
+        '',
+        'Note: the pressure line is provider-anchored (images/files priced by the live route); the breakdown above is a text-only estimate. They can differ on media-heavy sessions.',
+      )
     }
   }
   lines.push('', `Surface: ${surfaceSummary(session)}`)

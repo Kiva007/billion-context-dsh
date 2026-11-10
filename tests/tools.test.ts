@@ -1,15 +1,17 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
-import { createCore, type CompressionCore } from 'acp-kernel'
+import { createCore, indexToRef, type CompressionCore } from 'acp-kernel'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { Session } from '@deepseek-ai/dsh-session'
+import { createAssistantMessage } from '@deepseek-ai/dsh-llm'
 import { AcpStateStore } from '../src/state.ts'
-import { makeTools, type ToolEnvironment } from '../src/tools.ts'
-import { blockRegistry, rebuildBlockLedger } from '../src/region.ts'
+import { edgeRefForSeq, makeTools, mnRefIndex, type ToolEnvironment } from '../src/tools.ts'
+import { blockRegistry, rebuildBlockLedger, sliceDecompressPage, DEFAULT_DECOMPRESS_PAGE, DEFAULT_DECOMPRESS_PAGE_CHARS } from '../src/region.ts'
 import { rangeTable } from '../src/nudge.ts'
-import { appendTurn, appendToolResult, appendToolCall, appendMultiToolCall, appendUser, appendAssistant, buildTextSession, longText } from './helpers.ts'
+import { SUMMARY_FRAME_PREFIX } from '../src/messages.ts'
+import { appendTurn, appendToolResult, appendEmptyToolResult, appendToolCall, appendMultiToolCall, appendUser, appendAssistant, buildTextSession, buildShortTextSession, longText, wholeSurfaceRangeView } from './helpers.ts'
 
 function makeEnv(limit = 128000): ToolEnvironment {
   return {
@@ -55,6 +57,29 @@ function toolOf(env: ToolEnvironment, name: string) {
   return tool
 }
 
+/**
+ * Walk a paged decompress to completion and concatenate every page's text.
+ * Large-message fixtures now page to one message per call under the char budget,
+ * so tests that verify a block's FULL content must follow the continue hint
+ * instead of assuming a single call returns everything.
+ */
+async function decompressAll(env: ToolEnvironment, session: Session, blockId: string): Promise<string> {
+  const decompress = toolOf(env, 'decompress')
+  const chunks: string[] = []
+  let offset = 0
+  for (;;) {
+    const args: { blockId: string; offset?: number } = { blockId }
+    if (offset !== 0) args.offset = offset
+    const result = await decompress.execute(args, fakeExec(session))
+    const text = (result as { text: string }).text
+    chunks.push(text)
+    const next = /offset: (\d+) \}/.exec(text)
+    if (next === null) break
+    offset = Number(next[1])
+  }
+  return chunks.join('\n\n')
+}
+
 test('M3: compress lands a durable block, shrinks the surface, and uses the effective context window', async () => {
   const modelContextLimits: number[] = []
   const env = {
@@ -88,11 +113,34 @@ test('M3: compress lands a durable block, shrinks the surface, and uses the effe
   assert.equal(session.deriveMessages().length, 8)
 
   // The ledger sees the block from the log alone.
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 1)
   assert.deepEqual(ledger[0]!.shadowedSeqs, [1, 2, 3, 4, 5])
   assert.ok(ledger[0]!.shadowedTokenCount > 0, 'the ledger records real reclaimed tokens, not 0')
   assert.deepEqual(modelContextLimits, [1000000], 'compress gives the kernel the auto-detected window, not the 128K fallback')
+})
+
+test('M3: compress stamps the summary with the LIVE route, not stale agent.options', async () => {
+  // A mid-session model switch: the session's last request/context event names
+  // the CURRENT route while the agent's options still hold the just-left one.
+  // Reading provenance from agent.options mislabels the summary — the same
+  // stale read the window cap had, which this PR fixes for the window only.
+  const env = makeEnv()
+  const session = buildTextSession(12)
+  session.append('request/context', { provider: 'live-provider', model: 'live-model' })
+  const compress = toolOf(env, 'compress')
+  await compress.execute({
+    content: [{
+      startSeq: 1,
+      endSeq: 5,
+      summary: 'Authentication system: JWT access tokens with 15 minute expiry, refresh tokens in Redis with 30 day TTL, login flow in src/auth/login.ts with sliding-window rate limiting at 10 requests per minute per IP address.',
+    }],
+  } as never, fakeExec(session))
+
+  const summaryEvent = session.snapshotEvents().find((event) => event.type === 'compaction/summary')
+  assert.ok(summaryEvent, 'compaction/summary landed')
+  assert.equal((summaryEvent.data as { provider?: string }).provider, 'live-provider', 'the summary carries the LIVE provider')
+  assert.equal((summaryEvent.data as { model?: string }).model, 'live-model', 'the summary carries the LIVE model')
 })
 
 test('M3: successful compress registers its call id for post-result pair hiding', async () => {
@@ -137,7 +185,7 @@ test('M3: compress accepts multiple disjoint ranges in one call, each its own bl
   assert.match(text, /seqs 7\.\.9/)
 
   // Both segments land as independent durable blocks with distinct ids.
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 2)
   assert.deepEqual(ledger[0]!.shadowedSeqs, [1, 2, 3])
   assert.deepEqual(ledger[1]!.shadowedSeqs, [7, 8, 9])
@@ -160,17 +208,86 @@ test('M3: decompress recovers the shadowed originals read-only', async () => {
     }],
   } as never, fakeExec(session))
 
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 1)
   const blockId = ledger[0]!.blockId
 
-  const decompress = toolOf(env, 'decompress')
-  const result = await decompress.execute({ blockId }, fakeExec(session))
-  const text = (result as { text: string }).text
+  const text = await decompressAll(env, session, blockId)
   assert.match(text, /\[msg 0\]/)
   assert.match(text, /\[msg 4\]/)
   // The surface is untouched by decompress.
   assert.equal(session.deriveMessages().length, 8)
+})
+
+test('M3: decompress pages a large block by size and walks it with offset', async () => {
+  const env = makeEnv()
+  const session = buildTextSession(121)
+  const compress = toolOf(env, 'compress')
+  await compress.execute({
+    content: [{
+      startSeq: 1,
+      endSeq: 120,
+      summary: 'One hundred twenty long authentication messages: JWT access tokens with 15 minute expiry, refresh tokens in Redis with 30 day TTL, login flow in src/auth/login.ts with sliding-window rate limiting, bcrypt cost 12, session revocation on password change.',
+    }],
+  } as never, fakeExec(session))
+
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
+  assert.equal(ledger.length, 1)
+  const blockId = ledger[0]!.blockId
+  const decompress = toolOf(env, 'decompress')
+
+  // issue #112(b): one page must come back intact, not silently trimmed — so a
+  // single page's emitted text stays under the host tool-result pruner
+  // threshold (8192). The ~4KB-per-message fixture can't fit two messages in a
+  // page, so the char budget bounds it far below the 100-message ceiling.
+  const firstText = ((await decompress.execute({ blockId }, fakeExec(session))) as { text: string }).text
+  const header = /\[messages 1\.\.(\d+) of 120\]/.exec(firstText)
+  assert.ok(header, `page header present: ${firstText.slice(0, 160)}`)
+  const pageSize = Number(header[1])
+  assert.ok(pageSize >= 1 && pageSize < DEFAULT_DECOMPRESS_PAGE, `char budget keeps the page below the message ceiling (got ${pageSize})`)
+  assert.ok(firstText.length < 8192, `one page stays under the host pruner threshold (got ${firstText.length} chars)`)
+  assert.match(firstText, /\[seq 1\] /)
+  assert.match(firstText, /More available/)
+
+  const all = await decompressAll(env, session, blockId)
+  assert.match(all, /\[seq 1\] /)
+  assert.match(all, /\[seq 120\] /)
+
+  const beyondText = ((await decompress.execute({ blockId, offset: 500 }, fakeExec(session))) as { text: string }).text
+  assert.match(beyondText, /offset 500 is past the end/)
+})
+
+test('M3: decompress honors an explicit limit and clamps a negative offset', async () => {
+  const env = makeEnv()
+  // Short messages so two fit well under one page's char budget (an explicit
+  // limit is honored verbatim rather than cut by size — issue #112). The session
+  // must be long for two independent kernel gates on the compressed range:
+  //   - min-compress: the range needs >= 5000 chars (80 msgs x ~87 clears it);
+  //   - preserveRecentTokens (default 5000): the kernel protects messages walking
+  //     backward from the end until 5000 tokens accumulate. At ~22 tokens/msg that
+  //     is ~227 msgs, so a short session is ENTIRELY protected and nothing lands —
+  //     build 400 msgs so only the tail (~last 227) is protected and the early
+  //     1..80 range stays fully compressible.
+  const session = buildShortTextSession(400)
+  const compress = toolOf(env, 'compress')
+  await compress.execute({
+    content: [{
+      startSeq: 1,
+      endSeq: 80,
+      summary: 'Eighty short authentication lines covering JWT access tokens, Redis refresh tokens, login flow, rate limiting, bcrypt cost 12, and session revocation on password change.',
+    }],
+  } as never, fakeExec(session))
+  const blockId = rebuildBlockLedger(session.snapshotEvents())[0]!.blockId
+  const decompress = toolOf(env, 'decompress')
+
+  const limited = ((await decompress.execute({ blockId, limit: 2 }, fakeExec(session))) as { text: string }).text
+  assert.match(limited, /\[messages 1\.\.2 of 80\]/)
+  assert.match(limited, /offset: 2 \}/)
+  assert.doesNotMatch(limited, /\[seq 3\] /)
+
+  const clamped = ((await decompress.execute({ blockId, offset: -7 }, fakeExec(session))) as { text: string }).text
+  assert.match(clamped, /\[messages 1\.\.\d+ of 80\]/)
+  assert.doesNotMatch(clamped, /past the end/)
 })
 
 test('M3: decompress accepts the kernel block ref bN that acp_status shows', async () => {
@@ -185,15 +302,17 @@ test('M3: decompress accepts the kernel block ref bN that acp_status shows', asy
     }],
   } as never, fakeExec(session))
 
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   const kernelBlockId = ledger[0]!.kernelBlockId
   assert.match(kernelBlockId!, /^b\d+$/, 'the durable block records its kernel ref')
 
-  const decompress = toolOf(env, 'decompress')
-  const result = await decompress.execute({ blockId: kernelBlockId! }, fakeExec(session))
-  const text = (result as { text: string }).text
-  // The bN path resolves to the SAME durable block as the compaction id.
-  assert.match(text, /Block [0-9a-f-]{36} — Authentication/, 'bN resolves to the compaction id')
+  const text = await decompressAll(env, session, kernelBlockId!)
+  // The bN path resolves to the SAME durable block as the compaction id. Since B1
+  // (injection governance) the durable summary carries the model-written frame, so
+  // the header echoes it before the summary's first line.
+  assert.match(text, /Block [0-9a-f-]{36} — /, 'bN resolves to the compaction id')
+  assert.ok(text.includes(SUMMARY_FRAME_PREFIX), 'framed summary in the decompress header')
+  assert.match(text, /Authentication summary/)
   assert.match(text, /\[msg 0\]/)
   assert.match(text, /\[msg 4\]/)
 })
@@ -244,7 +363,7 @@ test('M3: decompress prefers an exact bN over a compaction-id prefix collision',
   // (e.g. "b2abcd12") falls through to the compaction-id prefix match. We
   // assert both directions with the real blocks: "b2" hits the kernel ref;
   // passing a UUID-looking string that is not a kernel ref falls back.
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   const second = ledger[1]!
 
   const decompress = toolOf(env, 'decompress')
@@ -340,7 +459,7 @@ test('M3: search_context on a distilled tier-2 block reports the innermost ownin
   await compress.execute({
     content: [{ startSeq: 1, endSeq: 5, summary: TIER_SUMMARY }],
   } as never, fakeExec(session))
-  const tier1 = rebuildBlockLedger(session.events)[0]!
+  const tier1 = rebuildBlockLedger(session.snapshotEvents())[0]!
   // Distill the tier-1 checkpoint into a tier-2 block.
   await compress.execute({
     content: [{ startSeq: tier1.summarySeq!, endSeq: tier1.summarySeq!, summary: TIER_SUMMARY }],
@@ -409,7 +528,7 @@ test('M3: acp_status uses the auto-detected window for pressure without showing 
   const status = await toolOf(env, 'acp_status').execute({}, fakeExec(session))
   const text = (status as { text: string }).text
   assert.match(text, /CONTEXT BREAKDOWN/, 'kernel breakdown still rendered')
-  // The window is a human-side (/acp) concern; the model tool never sees it.
+  // The window is a human-side (/acp-prune) concern; the model tool never sees it.
   assert.ok(!/context window/.test(text), 'window rows stay out of the model tool even with a probed window')
   assert.ok(!/estimated context/.test(text), 'window-occupancy rows stay out of the model tool')
   assert.deepEqual(modelContextLimits, [1000000], 'acp_status gives the kernel the auto-detected window, not the 128K fallback')
@@ -469,7 +588,7 @@ test('M3: acp_status breakdown does not double-count the checkpoint summary (P1-
   const summaries = breakdown.match(/([\d.]+K?) summaries/)?.[1] ?? '0'
   assert.ok(summaries !== '0', `summaries counted: got "${summaries}"`)
   // And the summary's token count is exactly what the block ledger reports.
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   const summaryTokens = ledger.reduce((sum, block) => sum + block.shadowedTokenCount, 0)
   assert.ok(summaryTokens > 0, 'ledger records real reclaimed tokens')
 })
@@ -558,7 +677,7 @@ test('M3: compress accepts drilldown mN refs, mapped to the live surface seqs', 
     }],
   } as never, fakeExec(session))
   assert.match((result as { text: string }).text, /Compressed 1 block/)
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 1, 'the mN-targeted range landed a durable block')
 })
 
@@ -586,6 +705,22 @@ test('M3: compress rejects unknown mN refs with guidance; mixed mN/seq boundarie
   assert.match((result as { text: string }).text, /Compressed 1 block/)
 })
 
+test('M3: drilldown mN refs stay parseable past the kernel ref-width bump', () => {
+  // The kernel numbers refs upward inside a session and never reuses one, so a
+  // long session keeps climbing: 0.0.101 widened `REF_PATTERN`/`MAX_INDEX` from
+  // 5 digits / 99999 to 7 digits / 9999999. A host parser still capped at five
+  // digits would reject acp_status's OWN `m100000` rows as "not a ref" — in
+  // exactly the sessions the bump exists to rescue (issue #187's ~100K-event
+  // sessions). Pin the boundary against the kernel's own formatter, so a future
+  // widening fails HERE instead of silently degrading the model's boundaries.
+  assert.equal(mnRefIndex(indexToRef(99_999)), 99_999, 'the last pre-bump ref still parses')
+  assert.equal(mnRefIndex(indexToRef(100_000)), 100_000, 'the first 6-digit ref parses (was silently rejected)')
+  assert.equal(mnRefIndex(indexToRef(9_999_999)), 9_999_999, 'the kernel cap parses')
+  // Non-refs still fall through to the bare-seq parser (no false positives).
+  assert.equal(mnRefIndex('m10000000'), null, 'an 8-digit number is not a kernel ref')
+  assert.equal(mnRefIndex('m000'), null, 'ref indices start at 1')
+  assert.equal(mnRefIndex('295'), null, 'a bare seq is not an mN ref')
+})
 test('M3: acp_status uncompressed drilldown excludes the checkpoint summary node', async () => {
   // P2-2: the summary node (source.plugin === 'compact') must not appear as a
   // drilldown row — it is already counted as block summaries. 12 msgs - 5
@@ -709,7 +844,7 @@ test('M3: compress tolerates the wrapped-arguments form ({ arguments: "..." } do
   const result = await compress.execute(wrapped as never, fakeExec(session))
   const text = (result as { text: string }).text
   assert.match(text, /Compressed 1 block/, 'the wrapped form unwraps and compresses the same content')
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 1, 'the wrapped form lands the durable block')
 })
 
@@ -719,7 +854,7 @@ test('M3: compress reports a clear error when neither form carries content', asy
   const compress = toolOf(env, 'compress')
   const result = await compress.execute({ arguments: 'not even json' } as never, fakeExec(session))
   assert.match((result as { text: string }).text, /missing content/, 'no content in either form yields the guidance message')
-  assert.equal(rebuildBlockLedger(session.events).length, 0, 'no block lands without content')
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 0, 'no block lands without content')
 })
 
 test('M3: compress schema gate rejects a range entry missing summary (required field)', async () => {
@@ -741,7 +876,7 @@ test('M3: compress schema gate rejects a range entry missing summary (required f
     /missing required property "content\[0\]\.summary"/,
     'a summary-less range entry fails at the schema gate and names the missing field',
   )
-  assert.equal(rebuildBlockLedger(session.events).length, 0, 'no block lands from a schema-rejected call')
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 0, 'no block lands from a schema-rejected call')
   const ok = await compress.execute({
     content: [{
       startSeq: 1,
@@ -773,7 +908,7 @@ test('M3: compress schema gate rejects a topic-only entry, naming the missing se
     },
     'a topic-only entry names all three missing fields at the schema gate',
   )
-  assert.equal(rebuildBlockLedger(session.events).length, 0, 'no block lands from a schema-rejected topic-only call')
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 0, 'no block lands from a schema-rejected topic-only call')
 })
 
 test('M3: compress rejects a summary-less entry in the wrapped { arguments } form too', async () => {
@@ -791,7 +926,7 @@ test('M3: compress rejects a summary-less entry in the wrapped { arguments } for
     /missing required property "content\[0\]\.summary"/,
     'the wrapped form is rejected with the exact field path, not the late kernel error',
   )
-  assert.equal(rebuildBlockLedger(session.events).length, 0, 'no block lands from a wrapped schema-rejected call')
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 0, 'no block lands from a wrapped schema-rejected call')
   // L1: an empty/whitespace summary counts as missing, not merely present.
   await assert.rejects(
     compress.execute({ arguments: { content: [{ startSeq: 1, endSeq: 5, summary: '   ' }] } } as never, fakeExec(session)),
@@ -813,7 +948,7 @@ test('M3: the wrapped OBJECT arguments form still compresses a full entry', asyn
     arguments: { content: [{ startSeq: 1, endSeq: 5, summary: SUMMARY_SAMPLE }] },
   } as never, fakeExec(session))
   assert.match((result as { text: string }).text, /Compressed 1 block/, 'the wrapped object form unwraps and compresses')
-  assert.equal(rebuildBlockLedger(session.events).length, 1, 'the wrapped object form lands the durable block')
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 1, 'the wrapped object form lands the durable block')
 })
 
 test('M3: an empty array content is benign — zero blocks, no error', async () => {
@@ -824,7 +959,7 @@ test('M3: an empty array content is benign — zero blocks, no error', async () 
   const compress = toolOf(env, 'compress')
   const result = await compress.execute({ content: [] } as never, fakeExec(session))
   assert.match((result as { text: string }).text, /Compressed 0 block\(s\)/, 'an empty content array is a no-op, not an error')
-  assert.equal(rebuildBlockLedger(session.events).length, 0, 'no block lands from an empty content array')
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 0, 'no block lands from an empty content array')
 })
 
 /** A session whose second node is a multi-tool-call assistant message. */
@@ -844,14 +979,16 @@ function buildMultiCallSession(): Session {
   return session
 }
 
-test('M3: compress expands a lone multi-tool-call boundary to the clean pair', async () => {
+test('M3: compress maps a lone multi-tool-call boundary onto its own round (issue #155)', async () => {
   const env = makeEnv()
   const session = buildMultiCallSession()
   const compress = toolOf(env, 'compress')
   // seq 2 is a multi-tool-call assistant message: it has NO bare '2' ref (the
-  // projection keys are '2#c1' / '2#c2'), so a naive byRaw lookup fails. A lone
-  // request on it expands outward to the smallest clean enclosing pair — the
-  // whole call/result round (1..4) — whose edges are plain-ref messages.
+  // projection keys are '2#c1' / '2#c2'). Pre-#155 a lone request on it
+  // expanded outward to the whole round INCLUDING the previous user turn
+  // (1..4); now node 2 anchors its own call/result round (2..4), and the start
+  // edge's kernel ref is its FIRST sub-id — so the kernel consumes exactly the
+  // messages the durable transaction shadows.
   const result = await compress.execute({
     content: [{
       startSeq: 2,
@@ -861,9 +998,102 @@ test('M3: compress expands a lone multi-tool-call boundary to the clean pair', a
   } as never, fakeExec(session))
 
   assert.match((result as { text: string }).text, /Compressed 1 block/)
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 1)
-  assert.deepEqual(ledger[0]!.shadowedSeqs, [1, 2, 3, 4])
+  assert.deepEqual(ledger[0]!.shadowedSeqs, [2, 3, 4])
+})
+
+test('M3: edgeRefForSeq falls back through sub-ids and the live surface (issue #155)', () => {
+  // Fixture A: [1 user, 2 multi-call(a,b), 3 EMPTY result(a), 4 text result(b)]
+  const sessionA = Session.create('edgerefs-a')
+  appendTurn(sessionA, 1)
+  appendUser(sessionA, longText('q', 0))                      // seq 1
+  appendMultiToolCall(sessionA, 'plan', ['a', 'b'], 1, 1)     // seq 2
+  appendEmptyToolResult(sessionA, 'a', 1, 1)                  // seq 3 (no ref of any kind)
+  appendToolResult(sessionA, longText('res', 0), 'b', 1, 1)   // seq 4
+  const byRawA: Record<string, string> = {
+    '1': 'm00001',
+    '2#a': 'm00002',
+    '2#b': 'm00003',
+    '4': 'm00004',
+  }
+  // Tier 1: a bare-ref node is returned as-is.
+  assert.equal(edgeRefForSeq(sessionA, byRawA, 1, 'start', 4), 'm00001')
+  // Tier 2: a multi-call node anchors via ITS OWN sub-ids, ordered by the
+  // message content — first sub-id for a start edge, last for an end edge.
+  assert.equal(edgeRefForSeq(sessionA, byRawA, 2, 'start', 4), 'm00002')
+  assert.equal(edgeRefForSeq(sessionA, byRawA, 2, 'end', 1), 'm00003')
+  // Tier 3: a ref-less node (empty result) borrows the nearest ref-bearing
+  // LIVE surface node toward the opposite edge — forward for a start edge...
+  assert.equal(edgeRefForSeq(sessionA, byRawA, 3, 'start', 4), 'm00004')
+  // ...backward for an end edge (landing on the multi-call's last sub-id).
+  assert.equal(edgeRefForSeq(sessionA, byRawA, 3, 'end', 2), 'm00003')
+
+  // Fixture B: two ADJACENT empty results — a span with no messages at all.
+  const sessionB = Session.create('edgerefs-b')
+  appendTurn(sessionB, 1)
+  appendUser(sessionB, longText('q', 0))                      // seq 1
+  appendMultiToolCall(sessionB, 'plan', ['a', 'b'], 1, 1)     // seq 2
+  appendEmptyToolResult(sessionB, 'a', 1, 1)                  // seq 3
+  appendEmptyToolResult(sessionB, 'b', 1, 1)                  // seq 4
+  const byRawB: Record<string, string> = {
+    '1': 'm00001',
+    '2#a': 'm00002',
+    '2#b': 'm00003',
+  }
+  // The walk is clamped to the span; when no node in it carries a ref the
+  // caller keeps its existing "no assigned ref" error instead of guessing.
+  assert.equal(edgeRefForSeq(sessionB, byRawB, 3, 'start', 4), undefined)
+  assert.equal(edgeRefForSeq(sessionB, byRawB, 4, 'end', 3), undefined)
+})
+
+test('M3: compressing an all-empty round folds only the multi-call subs (issue #155 review)', async () => {
+  // The exact shape from the PR review: a LIVE user turn precedes a fully
+  // consumed multi-call round whose results are BOTH empty. PR #156's fallback
+  // anchored the end edge on that preceding user turn (inverted range → visible
+  // content folded into the block); the end edge must fall back onto the round's
+  // own last sub-id instead, so only the two sub-messages are consumed.
+  const env = makeEnv()
+  const session = Session.create('allempty')
+  appendTurn(session, 1)
+  appendUser(session, longText('q', 0))                      // seq 1 (must survive)
+  // Multi-call round whose RESULTS are empty — the span's volume comes from
+  // the call arguments (the kernel's 5000-char minimum), not from any result.
+  session.append('assistant/message', {
+    turn: 1,
+    step: 1,
+    stream: [],
+    message: createAssistantMessage({
+      content: [
+        { type: 'text', text: 'plan' },
+        { type: 'tool-call', id: 'a', name: 'bash', arguments: longText('cmd-a', 0) },
+        { type: 'tool-call', id: 'b', name: 'bash', arguments: longText('cmd-b', 1) },
+      ],
+      provider: 'test-provider',
+      model: 'test-model',
+    }),
+  }, { surfaceOp: 'append' })                                // seq 2
+  appendEmptyToolResult(session, 'a', 1, 1)                  // seq 3
+  appendEmptyToolResult(session, 'b', 1, 1)                  // seq 4
+  const result = await toolOf(env, 'compress').execute({
+    content: [{
+      startSeq: 2,
+      endSeq: 4,
+      summary: 'This summary is long enough to pass the kernel minimum length threshold of fifty characters for the compressible content range.',
+    }],
+  } as never, fakeExec(session))
+
+  assert.match((result as { text: string }).text, /Compressed 1 block/)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
+  assert.equal(ledger.length, 1)
+  assert.deepEqual(ledger[0]!.shadowedSeqs, [2, 3, 4])
+  // The kernel folded EXACTLY the two sub-messages — nothing before or after.
+  assert.deepEqual([...ledger[0]!.effectiveMessageIds!], ['2#a', '2#b'])
+  const nodes = session.surface.nodes
+  assert.ok(nodes.includes(1), 'the preceding live user turn survives on the surface')
+  for (const gone of [2, 3, 4]) {
+    assert.ok(!nodes.includes(gone), `seq ${gone} is shadowed off the surface`)
+  }
 })
 
 test('M3: compress shadows multi-tool-call messages inside a clean range', async () => {
@@ -882,7 +1112,7 @@ test('M3: compress shadows multi-tool-call messages inside a clean range', async
   } as never, fakeExec(session))
 
   assert.match((result as { text: string }).text, /Compressed 1 block/)
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 1)
   assert.deepEqual(ledger[0]!.shadowedSeqs, [1, 2, 3, 4, 5])
 })
@@ -890,7 +1120,7 @@ test('M3: compress shadows multi-tool-call messages inside a clean range', async
 test('M3: nudge range-table edges compress successfully (plain-ref boundaries)', async () => {
   const env = makeEnv()
   const session = buildMultiCallSession()
-  const table = rangeTable(session)
+  const table = rangeTable(session, wholeSurfaceRangeView(session))
   const match = /seq (\d+)\.\.(\d+)/.exec(table)
   assert.ok(match, 'range table renders a compressible span')
   const startSeq = Number(match![1])
@@ -917,7 +1147,7 @@ test('M3: distilling a block summary node produces a tier-2 block', async () => 
     content: [{ startSeq: 1, endSeq: 5, summary: TIER_SUMMARY }],
   } as never, fakeExec(session))
 
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 1)
   assert.equal(ledger[0]!.tier, 1)
   const summarySeq = ledger[0]!.summarySeq
@@ -933,7 +1163,7 @@ test('M3: distilling a block summary node produces a tier-2 block', async () => 
   assert.match(text, /Compressed 1 block/)
   assert.match(text, /tier 2/, 'the block line reports the distillation tier')
 
-  const after = rebuildBlockLedger(session.events)
+  const after = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(after.length, 2)
   assert.equal(after[1]!.tier, 2)
   assert.deepEqual(after[1]!.shadowedSeqs, [summarySeq], 'the tier-2 block shadows the parent checkpoint node')
@@ -942,9 +1172,7 @@ test('M3: distilling a block summary node produces a tier-2 block', async () => 
   assert.ok(after[1]!.effectiveMessageIds!.includes('1'), 'the tier-2 block records its parents ORIGINAL coverage, not the checkpoint node')
 
   // decompress on the tier-2 block expands through the parent to the originals.
-  const decompress = toolOf(env, 'decompress')
-  const rec = await decompress.execute({ blockId: after[1]!.blockId }, fakeExec(session))
-  const recText = (rec as { text: string }).text
+  const recText = await decompressAll(env, session, after[1]!.blockId)
   assert.match(recText, /tier 2, distills 1 block/)
   assert.match(recText, /\[msg 0\]/)
   assert.match(recText, /\[msg 4\]/)
@@ -955,11 +1183,11 @@ test('M3: distilling a tier-2 block produces tier 3', async () => {
   const session = buildTextSession(12)
   const compress = toolOf(env, 'compress')
   await compress.execute({ content: [{ startSeq: 1, endSeq: 5, summary: TIER_SUMMARY }] } as never, fakeExec(session))
-  const ledger1 = rebuildBlockLedger(session.events)
+  const ledger1 = rebuildBlockLedger(session.snapshotEvents())
   const tier1Seq = ledger1[0]!.summarySeq!
   await compress.execute({ content: [{ startSeq: tier1Seq, endSeq: tier1Seq, summary: TIER_SUMMARY }] } as never, fakeExec(session))
 
-  const ledger2 = rebuildBlockLedger(session.events)
+  const ledger2 = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger2.length, 2)
   assert.equal(ledger2[1]!.tier, 2)
   const tier2Seq = ledger2[1]!.summarySeq
@@ -970,16 +1198,14 @@ test('M3: distilling a tier-2 block produces tier 3', async () => {
   } as never, fakeExec(session))
   assert.match((result as { text: string }).text, /tier 3/)
 
-  const after = rebuildBlockLedger(session.events)
+  const after = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(after.length, 3)
   assert.equal(after[2]!.tier, 3)
   assert.deepEqual(after[2]!.parentBlockIds, [ledger2[1]!.blockId])
   assert.equal(after[2]!.kernelBlockId, 'b3')
 
   // decompress recurses through BOTH levels back to the originals.
-  const decompress = toolOf(env, 'decompress')
-  const rec = await decompress.execute({ blockId: after[2]!.blockId }, fakeExec(session))
-  const recText = (rec as { text: string }).text
+  const recText = await decompressAll(env, session, after[2]!.blockId)
   assert.match(recText, /tier 3, distills 1 block/)
   assert.match(recText, /\[msg 0\]/)
   assert.match(recText, /\[msg 4\]/)
@@ -1000,7 +1226,7 @@ test('M3: overlapping batch entries skip the later range with a warning', async 
   assert.match(text, /Skipped range/, 'the overlap is surfaced as a warning')
   assert.match(text, /1 range\(s\) skipped/)
 
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 1, 'no phantom durable block for the skipped range')
   assert.deepEqual(ledger[0]!.shadowedSeqs, [1, 2, 3])
 })
@@ -1032,7 +1258,7 @@ test('M3: compress remaps a stale range to the still-live remainder', async () =
   assert.match(text, /were already shadowed — compressed the live remainder/)
   assert.match(text, /seqs 6\.\.10/)
 
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 2, 'the recovered range lands a second block')
   assert.deepEqual(ledger[1]!.shadowedSeqs, [6, 7, 8, 9, 10], 'only the live remainder is shadowed, never the checkpoint')
 })
@@ -1063,7 +1289,7 @@ test('M3: compress reports a fully shadowed range as already compressed, no erro
   assert.match(text, /already compressed/)
   assert.match(text, /decompress to recover/)
 
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 1, 'no phantom block for the stale re-compression')
 })
 
@@ -1098,7 +1324,7 @@ test('M3: a batch mixing a fresh range and a fully shadowed range lands one bloc
   assert.match(text, /already compressed/)
   assert.match(text, /1 range\(s\) skipped/)
 
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 2, 'the stale entry never creates a durable block')
   assert.deepEqual(ledger[1]!.shadowedSeqs, [7, 8, 9])
 })
@@ -1110,7 +1336,7 @@ test('M3: a mixed boundary [message..blockSummary] distills and folds extra mess
   // Tier-1 in the middle so the checkpoint lands AFTER older residual nodes.
   await compress.execute({ content: [{ startSeq: 3, endSeq: 7, summary: TIER_SUMMARY }] } as never, fakeExec(session))
 
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 1)
   const summarySeq = ledger[0]!.summarySeq!
   // Surface: [1, 2, c1, 8, 9, 10, 11, 12] — span [2..c1] crosses the block edge.
@@ -1120,7 +1346,7 @@ test('M3: a mixed boundary [message..blockSummary] distills and folds extra mess
   const text = (result as { text: string }).text
   assert.match(text, /tier 2/, 'a block boundary in the span makes the range distill')
 
-  const after = rebuildBlockLedger(session.events)
+  const after = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(after.length, 2)
   assert.equal(after[1]!.tier, 2)
   assert.deepEqual(after[1]!.shadowedSeqs, [2, summarySeq])
@@ -1128,15 +1354,18 @@ test('M3: a mixed boundary [message..blockSummary] distills and folds extra mess
 
   // The folded message (seq 2 = assistant, index 1) is recoverable alongside
   // the distilled originals (seqs 3..7 → [msg 2]..[msg 6]).
-  const decompress = toolOf(env, 'decompress')
-  const rec = await decompress.execute({ blockId: after[1]!.blockId }, fakeExec(session))
-  const recText = (rec as { text: string }).text
+  const recText = await decompressAll(env, session, after[1]!.blockId)
   assert.match(recText, /\[reply 1\]/, 'the folded assistant message is in the recursion')
   assert.match(recText, /\[msg 4\]/, 'a distilled original from the parent block is in the recursion')
 })
 
 test('M3: a kernel-rejected range does not poison the rest of the compress call', async () => {
   const env = makeEnv()
+  // The newest REAL user turn is seq 11, so the rejected range below (12..12,
+  // the assistant tail) sits in the kernel's protected zone WITHOUT covering
+  // the guarded active user turn — issue #196 moved that protection
+  // engine-side, and a range over seq 11 would be hard-rejected here instead
+  // of reaching the kernel.
   const session = buildTextSession(12)
   const compress = toolOf(env, 'compress')
   const result = await compress.execute({
@@ -1147,16 +1376,16 @@ test('M3: a kernel-rejected range does not poison the rest of the compress call'
         summary: 'Authentication system: JWT access tokens with 15 minute expiry, refresh tokens in Redis with 30 day TTL, login flow in src/auth/login.ts with sliding-window rate limiting at 10 requests per minute per IP address, bcrypt hashing at cost factor 12.',
       },
       {
-        startSeq: 11,
+        startSeq: 12,
         endSeq: 12,
-        summary: 'Recent tail messages fall inside the kernel protected zone, so the kernel rejects this range while the first range still lands.',
+        summary: 'The assistant tail falls inside the kernel protected zone, so the kernel rejects this range while the first range still lands.',
       },
     ],
   } as never, fakeExec(session))
   const text = (result as { text: string }).text
   assert.match(text, /Compressed 1 block/, 'the healthy range still lands')
   assert.match(text, /protected zone/, 'the rejected range is reported, not fatal')
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 1, 'exactly the healthy range produced a block')
 })
 
@@ -1187,7 +1416,7 @@ test('M3: issue #60 P3① — the nudge tier seqs (first..last) compress straigh
   assert.match(text, /tier 2/, 'distilling the nudge seqs as one range produces a tier-2 block')
   assert.match(text, /messages shadowed, tier 2/, 'the tier label is always present (issue #60 P1②)')
 
-  const after = rebuildBlockLedger(session.events)
+  const after = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(after.length, 3, 'the two tier-1 blocks plus one tier-2 block')
   assert.equal(after[2]!.tier, 2, 'the distilled block is tier 2')
   assert.deepEqual(after[2]!.parentBlockIds, [after[0]!.blockId, after[1]!.blockId], 'both parents are recorded durably')
@@ -1209,16 +1438,89 @@ test('M3: issue #60 P3② — every compress result reports its tier, including 
   assert.match(text, /Compressed 1 block/)
   assert.match(text, /, tier 1/, 'a plain tier-1 compress reports its tier explicitly — never a silent downgrade')
 
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger[0]!.tier, 1, 'the block really is tier 1')
 
   // Distillation still reports tier 2 (the existing distill tests cover the
   // tier-2 label; this assertion pins the label on the SAME result format).
   await compress.execute({ content: [{ startSeq: 6, endSeq: 8, summary: TIER_SUMMARY }] } as never, fakeExec(session))
-  const ledger2 = rebuildBlockLedger(session.events)
+  const ledger2 = rebuildBlockLedger(session.snapshotEvents())
   const tier1Seq = ledger2[0]!.summarySeq!
   const dist = await compress.execute({
     content: [{ startSeq: tier1Seq, endSeq: tier1Seq, summary: TIER_SUMMARY }],
   } as never, fakeExec(session))
   assert.match((dist as { text: string }).text, /, tier 2/, 'the distilled block reports tier 2 in the same format')
+})
+
+test('M3: sliceDecompressPage caps the limit, guards bad input, and stops at the char budget', () => {
+  const many = Array.from({ length: 200 }, (_, i) => i)
+
+  // Tiny messages (10 chars): the 100-message ceiling binds, not the char budget.
+  const capped = sliceDecompressPage(many, 0, DEFAULT_DECOMPRESS_PAGE, DEFAULT_DECOMPRESS_PAGE_CHARS, () => 10)
+  assert.equal(capped.seqs.length, DEFAULT_DECOMPRESS_PAGE, 'the default page is capped at the message ceiling')
+  assert.ok(!capped.exhausted)
+
+  const hugeLimit = sliceDecompressPage(many, 0, 100000, DEFAULT_DECOMPRESS_PAGE_CHARS, () => 10)
+  assert.equal(hugeLimit.seqs.length, DEFAULT_DECOMPRESS_PAGE, 'an oversized explicit limit is clamped to the ceiling')
+
+  // 1000-char messages: the char budget binds first — floor(7000/1000) fit.
+  const budgeted = sliceDecompressPage(many, 0, DEFAULT_DECOMPRESS_PAGE, DEFAULT_DECOMPRESS_PAGE_CHARS, () => 1000)
+  assert.equal(budgeted.seqs.length, Math.floor(DEFAULT_DECOMPRESS_PAGE_CHARS / 1000), `char budget bounds the page (got ${budgeted.seqs.length})`)
+
+  // Non-numeric offset/limit fall back to defaults instead of producing a NaN slice.
+  const badInput = sliceDecompressPage(many, Number.NaN, Number.NaN, DEFAULT_DECOMPRESS_PAGE_CHARS, () => 10)
+  assert.equal(badInput.offset, 0)
+  assert.equal(badInput.seqs.length, DEFAULT_DECOMPRESS_PAGE)
+
+  // An offset past the end yields an empty, exhausted page.
+  const pastEnd = sliceDecompressPage([1, 2, 3], 100, 10, DEFAULT_DECOMPRESS_PAGE_CHARS, () => 10)
+  assert.deepEqual(pastEnd.seqs, [])
+  assert.equal(pastEnd.total, 3)
+  assert.ok(pastEnd.exhausted)
+
+  // A single message larger than the whole budget still returns one message (forward progress).
+  const loneHuge = sliceDecompressPage([1, 2], 0, 10, 100, () => 5000)
+  assert.deepEqual(loneHuge.seqs, [1])
+  assert.ok(!loneHuge.exhausted, 'a second message exists beyond the over-budget first one')
+})
+
+test('M3: decompress keeps every tool-heavy page under the host pruner threshold (issue #112)', async () => {
+  const env = makeEnv()
+  const session = Session.create('tool-heavy')
+  appendTurn(session, 1)
+  appendUser(session, longText('request', 0))
+  for (let i = 0; i < 6; i += 1) {
+    appendToolCall(session, `run step ${i}`, `call_${i}`)
+    appendToolResult(session, longText(`tool-out`, i), `call_${i}`)
+  }
+  appendAssistant(session, longText('done', 0), 1, 8)
+  // A follow-up user turn AFTER the span: since issue #196 the newest real
+  // user turn is hard-guarded, so the span below must end before it.
+  appendUser(session, longText('followup', 99))
+  const compress = toolOf(env, 'compress')
+  await compress.execute({
+    content: [{ startSeq: 1, endSeq: 14, summary: 'Six large bash tool outputs and their steps: JWT access tokens, Redis refresh tokens, login flow, rate limiting, bcrypt cost 12, session revocation.' }],
+  } as never, fakeExec(session))
+  const blockId = rebuildBlockLedger(session.snapshotEvents())[0]!.blockId
+  const decompress = toolOf(env, 'decompress')
+
+  // Walk every page; each one must come back intact under the host pruner threshold.
+  let offset = 0
+  let pages = 0
+  const recovered: string[] = []
+  for (;;) {
+    const args: { blockId: string; offset?: number } = { blockId }
+    if (offset !== 0) args.offset = offset
+    const text = ((await decompress.execute(args, fakeExec(session))) as { text: string }).text
+    pages += 1
+    recovered.push(text)
+    assert.ok(pages <= 50, 'the walk must terminate')
+    assert.ok(text.length < 8192, `page ${pages} stays under the host pruner threshold (got ${text.length} chars)`)
+    const next = /offset: (\d+) \}/.exec(text)
+    if (next === null) break
+    offset = Number(next[1])
+  }
+  const all = recovered.join('\n\n')
+  assert.ok(pages >= 2, 'a multi-KB tool block spans more than one page')
+  assert.match(all, /\[tool-out \d+\]/, 'extractEventText recurses into the nested tool-result content on every page')
 })
