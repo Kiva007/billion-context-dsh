@@ -46,7 +46,7 @@ import { acpCommand } from './commands.ts'
 import { buildNudge, EMERGENCY_NUDGE_MAX_PER_TURN, meterMediaPriceResolver, resolveTokenCount } from './nudge.ts'
 import { ACP_SYSTEM_PROMPT_ORDER } from './system-prompt.ts'
 import { renderSystemPrompt, resolvePrompts, type AcpPrompts, type ResolvedPrompts } from './prompts.ts'
-import { DEFAULT_CONTEXT_WINDOW, probeModelWindow, projectedContextWindow, routeFor, type AcpWindow } from './window.ts'
+import { DEFAULT_CONTEXT_WINDOW, probeModelWindow, projectedContextWindow, routeFor, selectedRoute, type AcpWindow } from './window.ts'
 import {
   buildCompressibleSeqRanges,
   deferCompressPairHide,
@@ -723,7 +723,7 @@ export class AcpCompactionEngine extends CompactionEngine {
       if (!engine.readSettingsSource().autoNudge) return next()
       const decision = await next()
       if (decision.kind === 'reject') return decision
-      const window = await this.windowFor(payload.agent)
+      const window = await this.windowFor(payload.agent, payload.modelSelection)
       const outcome = buildNudge(
         payload.agent,
         { ...env, modelContextLimit: window.limit },
@@ -854,23 +854,22 @@ export class AcpCompactionEngine extends CompactionEngine {
    * exact value (they own the denominator); a failed probe keeps the raw
    * fallback.
    */
-  async windowFor(agent: Agent): Promise<AcpWindow> {
+  async windowFor(agent: Agent, selection?: { readonly provider: string; readonly model: string }): Promise<AcpWindow> {
     const live = this.readSettingsSource()
     if (live.modelContextLimit !== undefined) {
       return { limit: live.modelContextLimit, source: 'explicit' }
     }
-    // The per-route output cap must be looked up against the session's LIVE
-    // route or it lags one switch behind (a stale agent.options snapshot names
-    // the PREVIOUS route) — routeFor owns that fallback chain for every caller.
-    const { provider, model } = routeFor(agent)
+    // Pre-step passes its captured selection: current() can change while next()
+    // runs. Outside a step use the next live choice, retaining the legacy
+    // request/options fallback. Durable provenance deliberately uses routeFor.
+    const selected = selection ?? selectedRoute(agent)
+    const { provider, model } = selected ?? routeFor(agent)
     const key = `${provider}\0${model}`
-    // Projection source first: it reflects the live route (agent.options is a
-    // stale snapshot after a model switch), and it is not cached here because
-    // the projection itself refreshes on every request — caching would freeze
-    // the old model's window for the whole process (the false-EMERGENCY trap).
-    // Only consulted when auto detection is enabled (same gate as the probe).
+    // The last request's projection is usable only for the same route. A
+    // pending switch probes the selected model until request/context catches up.
+    // Legacy hosts without model.current preserve their projection-first path.
     if (live.autoModelContextLimit) {
-      const projected = projectedContextWindow(agent)
+      const projected = projectedContextWindow(agent, selected ?? undefined)
       if (projected !== null) {
         // The window comes from the live projection; the output cap comes from
         // the (cached) model probe for the LIVE route — the projection schema
@@ -972,7 +971,7 @@ export class AcpCompactionEngine extends CompactionEngine {
     const coreMessages = allLogMessages(session)
     const surfaceMessages = eventsToCoreMessages(surfaceEventsOf(session))
     const tokenCount = resolveTokenCount(agent, surfaceMessages)
-    const window = await this.windowFor(agent)
+    const window = await this.windowFor(agent, routeFor(agent))
     const config = kernelConfigFor({ ...this.env, modelContextLimit: window.limit })
     // processTurn assigns the mNNNNN ref map the kernel transaction needs
     // (the same contract handleCompress relies on); renderTags 'none' keeps

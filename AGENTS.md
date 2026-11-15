@@ -128,6 +128,16 @@ The convention applies to the **squash-merge subject on main**, which IS the PR 
 
 The PR title is enforced by CI (`.github/workflows/pr-lint.yml` → `scripts/check-pr-title.mjs`), since a squash merge turns it into the main-branch commit (e.g. `(feat) guide multi-segment batch compress + regression test`). Contributor guidance lives in CONTRIBUTING.md. PR merges stay human-only (§5).
 
+## Verified local upgrade baseline (2026-11-15)
+
+This branch targets exact DSH 0.2.2-rc.1 with Cordis 4.1.0 / loader 1.1.0 / Schemastery 3.19.0 / Cosmokit 1.9.0. It retains historical peer ranges plus exact rc.5 and rc.1 exceptions; do not widen neighboring versions without verification. The historical dev baseline instructions below describe earlier releases and are superseded by this paragraph for this branch.
+
+The kernel is unchanged acp-kernel 0.0.198, vendored from billion-context commit 3e42aae8bfa6d2f3bf48d376eaaaac27afbcf806, consumed as file:vendor/acp-kernel. snapshot.json and tests/kernel-vendor.test.ts pin upstream bytes. No algorithm edits or dependency lifecycle hooks. Keep its LICENSE and visible documentation attribution, including the additional attribution term. Root tsup still inlines the kernel.
+
+Nudge copy remains kernel-owned except host-specific tool dialect: render executable content arrays and guarded surface ranges; always replace even an empty guarded table, never expose rejected raw candidates. Kernel recent3 and host surface-node recent5 are different, deliberate protection layers. Model capacity follows captured pre-step modelSelection, then current choice where applicable; tool provenance and overflow use the recorded request route. Persistence tests mount the named JSONL plugin and skip ONLY for actual absent zstd APIs.
+
+Rule12 correction: modern host prices nested tool-result blocks as structural JSON, system text with role-only framing, and ignores image offloaded flags for fixed claims. Prefer measured heuristicTokens, then bound meter.estimateMessage when exposed, then the parity-tested compatibility mirror. Official estimator exports now exist; avoid mandatory imports that would break retained older hosts. Large-corpus hybrid normalization crash is fixed in 0.0.198; historical rule14 bug description is retained as history, not current behavior.
+
 ## 4b. acp-kernel upgrade policy (the kernel WILL move on)
 
 `acp-kernel` is pinned **exactly** (e.g. `0.0.101`, never `^`) because tsup inlines it — a caret range makes the resolved version drift when the lockfile regenerates, breaking reproducible builds. But pinning is **not** freezing: upgrades are a controlled, manual process.

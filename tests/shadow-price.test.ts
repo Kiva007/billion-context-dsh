@@ -319,11 +319,9 @@ test('L3: estimateHostContent mirrors the host estimator exactly (edge cases)', 
   assert.equal(estimateHostContent([{ type: 'text', text: '中文面试' }]), 5)
   // tool-call: ceil(4/4) + ceil(13/4) + 4 = 1 + 4 + 4 = 9
   assert.equal(estimateHostContent([{ type: 'tool-call', name: 'bash', arguments: '{"command":"ls"}' }]), 9)
-  // tool-result with STRING content: every char falls to the default branch
-  // (4 + ceil(JSON.stringify(char)/4) = 5 per unescaped char).
-  assert.equal(estimateHostContent([{ type: 'tool-result', toolCallId: 'x', content: 'abc' }]), 3 * 5 + 4)
-  // nested tool-result content blocks recurse.
-  assert.equal(estimateHostContent([{ type: 'tool-result', toolCallId: 'x', content: [{ type: 'text', text: 'abcd' }] }]), 5 + 4)
+  // Legacy result wrappers use structural JSON pricing, not recursive content pricing.
+  assert.equal(estimateHostContent([{ type: 'tool-result', toolCallId: 'x', content: 'abc' }]), 18)
+  assert.equal(estimateHostContent([{ type: 'tool-result', toolCallId: 'x', content: [{ type: 'text', text: 'abcd' }] }]), 25)
   // unknown block: 4 + ceil(JSON.stringify/4) over the ORIGINAL object.
   const weird = { type: 'custom-block', payload: 'abcdefgh' }
   const expected = 4 + Math.ceil(JSON.stringify(weird).length / 4)

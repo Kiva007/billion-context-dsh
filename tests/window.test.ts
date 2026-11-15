@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import { AgentModel, type Agent, type ModelSelection } from '@deepseek-ai/dsh-agent'
 import { Session } from '@deepseek-ai/dsh-session'
 import AcpCompactionEngine from '../src/index.ts'
 import { DEFAULT_CONTEXT_WINDOW, detectContextWindow, liveRoute, probeModelWindow, projectedContextWindow } from '../src/window.ts'
@@ -421,4 +421,102 @@ test('window: liveRoute 只在两半都有效时返回路由，且从不抛错',
   assert.equal(liveRoute(withSession({ requestContext: () => null })), null, 'null 路由同样降级（必须在解构之前挡住）')
   assert.equal(liveRoute(withSession({ requestContext: () => { throw new Error('host exploded') } })), null, '宿主抛错时降级，而非炸掉 agent/pre-step')
   assert.equal(liveRoute(withSession({ requestContext: () => ({ provider: 'p', model: 'm' }) }))?.provider, 'p', '两半都有效时正常返回')
+})
+
+// A recorded next-step choice must not inherit the last request's capacity.
+function selectableAgent(ctx: Context): Agent {
+  const agent = fakeAgent(ctx, 'old-p', 'old-m')
+  agent.session.append('request/context', { provider: 'old-p', model: 'old-m', contextWindow: 96000 })
+  const model = new AgentModel(() => ({
+    lastUsed: { provider: 'old-p', model: 'old-m' },
+    pending: agent.session.snapshotEvents().findLast((row) => row.type === 'model/selection')?.data as ModelSelection | undefined ?? null,
+  }), agent.session, agent.options)
+  return { ...agent, model } as Agent
+}
+
+function switchingContext(): Context {
+  const ctx = new Context()
+  ctx.provide('sessionProjections', {
+    snapshot: () => ({ values: { contextPressure: { contextWindow: 96000 } } }),
+  })
+  ctx.provide('llm', {
+    resolveModelInfo: async (provider: string, model: string) => {
+      if (provider === 'new-p' && model === 'new-m') return { context: { contextWindow: 1000000 }, defaultMaxTokens: 16000 }
+      if (provider === 'old-p' && model === 'old-m') return { context: { contextWindow: 96000 }, defaultMaxTokens: 32000 }
+      throw new Error(`unexpected route ${provider}/${model}`)
+    },
+  })
+  return ctx
+}
+
+test('window: pending model selection uses the new capacity and cap before request/context catches up', async () => {
+  const agent = selectableAgent(switchingContext())
+  agent.model.select({ provider: 'new-p', model: 'new-m' })
+  const engine = new AcpCompactionEngine(new Context())
+  assert.deepEqual(await engine.windowFor(agent), {
+    limit: 984000, rawLimit: 1000000, outputReserved: 16000,
+    source: 'auto', provider: 'new-p', model: 'new-m',
+  })
+  assert.deepEqual(liveRoute(agent), { provider: 'old-p', model: 'old-m' }, 'in-flight tool provenance remains the request actually used')
+})
+
+test('window: a captured step selection survives a later model.select during the step', async () => {
+  const agent = selectableAgent(switchingContext())
+  const captured = agent.model.current()!
+  agent.model.select({ provider: 'new-p', model: 'new-m' })
+  const engine = new AcpCompactionEngine(new Context())
+  assert.deepEqual(await engine.windowFor(agent, captured), {
+    limit: 64000, rawLimit: 96000, outputReserved: 32000,
+    source: 'projection', provider: 'old-p', model: 'old-m',
+  })
+})
+
+test('window: a pending selection with no disclosed capacity never reuses stale projection', async () => {
+  const ctx = projectionContext({ snapshot: () => ({ values: { contextPressure: { contextWindow: 96000 } } }) })
+  const agent = selectableAgent(ctx)
+  agent.model.select({ provider: 'new-p', model: 'new-m' })
+  const engine = new AcpCompactionEngine(new Context())
+  assert.deepEqual(await engine.windowFor(agent), {
+    limit: DEFAULT_CONTEXT_WINDOW, source: 'default', probeFailed: true,
+    provider: 'new-p', model: 'new-m',
+  })
+})
+
+test('window: pre-step forwards the captured selection rather than rereading a later choice', async () => {
+  const root = new Context()
+  const engine = new AcpCompactionEngine(root)
+  const agent = selectableAgent(switchingContext())
+  const captured = agent.model.current()!
+  let received: unknown
+  engine.windowFor = async (_agent, selection) => {
+    received = selection
+    return { limit: 64000, source: 'explicit' }
+  }
+  await root.waterfall(
+    'agent/pre-step' as never,
+    { agent, modelSelection: captured } as never,
+    async () => {
+      agent.model.select({ provider: 'new-p', model: 'new-m' })
+      return { kind: 'enter', messages: [] } as never
+    },
+  )
+  assert.deepEqual(received, { provider: 'old-p', model: 'old-m' })
+})
+
+test('window: overflow recovery keeps the failed request route despite a pending next choice', async () => {
+  const root = new Context()
+  const engine = new AcpCompactionEngine(root)
+  const agent = selectableAgent(switchingContext())
+  agent.model.select({ provider: 'new-p', model: 'new-m' })
+  let received: unknown
+  engine.windowFor = async (_agent, selection) => {
+    received = selection
+    return { limit: 64000, source: 'explicit' }
+  }
+  await root.waterfall(
+    'agent/request-error' as never,
+    { agent, turn: 1, step: 1, provider: 'old-p', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', message: 'too long' }, signal: new AbortController().signal } as never,
+    async () => undefined as never,
+  )
+  assert.deepEqual(received, { provider: 'old-p', model: 'old-m' })
 })

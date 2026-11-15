@@ -285,7 +285,7 @@ function cjkDenseSession(turns: number, charsPerMessage: number): Session {
   return session
 }
 
-test('kernel range source: CJK sessions lose ranges to the kernel char-based merge floor (0.0.101 characterization)', () => {
+test('kernel range source: CJK sessions lose ranges to the kernel char-based merge floor (0.0.198 characterization)', () => {
   // Kernel 0.0.101 rewrote `mergeRangesToThreshold`: it batches candidates by
   // ARRAY-INDEX GAPS and DROPS any batch below `minCompressRange`. That floor is
   // counted in CHARS, while every other threshold on the nudge path is counted in
@@ -293,7 +293,7 @@ test('kernel range source: CJK sessions lose ranges to the kernel char-based mer
   // token floor while still sitting under the char floor and is thrown away.
   //
   // Consequence on this fixture (6 structurally identical work turns): with latin
-  // text the table offers 6 ranges; with CJK text of the same shape it offers 3,
+  // text the table offers 6 ranges; with CJK text of the same shape it offers 4 on kernel 0.0.198,
   // so the whole tail is unreclaimable — the model cannot compress those consumed
   // tool outputs at all, which is the one thing the range table exists for.
   //
@@ -308,7 +308,7 @@ test('kernel range source: CJK sessions lose ranges to the kernel char-based mer
 
   const cjkSession = cjkDenseSession(6, 1600)
   const cjk = buildCompressibleSeqRanges(cjkSession, kernelProbe(cjkSession).view, { preserveRecent: 0 })
-  assert.equal(cjk.length, 3, 'CJK: the char-based merge floor drops the tail ranges')
+  assert.equal(cjk.length, 4, 'CJK: the char-based merge floor still drops tail ranges on 0.0.198')
   assert.ok(
     cjk[cjk.length - 1]!.end < latin[latin.length - 1]!.end,
     'the dropped tail is real: the CJK table stops well before the latin one',

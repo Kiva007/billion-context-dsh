@@ -56,16 +56,15 @@ import { Context } from '@deepseek-ai/cordis'
 // Deliberately dynamic: a static import would fail at link time on Node < 22.15
 // (the codec's own static node:zlib zstd import) and kill every test in this
 // file, including the one below that never touches the persistence stack.
-let JsonlSessionPersistence: typeof import('@deepseek-ai/dsh-session-persistence-jsonl').default | undefined
-try {
-  JsonlSessionPersistence = (await import('@deepseek-ai/dsh-session-persistence-jsonl')).default
-} catch {
-  // Older Node without node:zlib zstd — round-trip tests skip with a reason.
-}
+const zlib = await import('node:zlib')
 const persistenceSkipReason =
-  JsonlSessionPersistence === undefined
+  typeof zlib.createZstdCompress !== 'function' || typeof zlib.zstdDecompressSync !== 'function'
     ? 'released JSONL codec needs node:zlib zstd (Node >= 22.15); running on an older Node'
     : false
+// Import/API failures on a supported Node are test failures, never skips.
+const JsonlSessionPersistence = persistenceSkipReason === false
+  ? await import('@deepseek-ai/dsh-session-persistence-jsonl')
+  : undefined
 import { Session, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { createAssistantMessage, createToolResultMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { compactCheckpointSource } from '@deepseek-ai/dsh-compaction'
@@ -239,8 +238,11 @@ async function persistAndReadBack(rows: readonly SessionEvent[], id: string): Pr
   const Store = JsonlSessionPersistence
   assert.ok(Store !== undefined, 'persistence codec must have loaded to run the round-trip')
   const root = mkdtempSync(join(tmpdir(), 'durable-admission-'))
+  const ctx = new Context()
+  const plugin = ctx.plugin(Store, { root })
   try {
-    const store = new Store(new Context(), { root })
+    await plugin.await()
+    const store = ctx.sessionPersistence
     const handle = await store.create({
       version: CURRENT_SESSION_FORMAT_VERSION,
       id,
@@ -252,11 +254,21 @@ async function persistAndReadBack(rows: readonly SessionEvent[], id: string): Pr
     try {
       await handle.append([...rows])
       await handle.flush()
-      return (await handle.read(0)).events
+      const back = (await handle.read(0)).events
+      await handle.close()
+      const reopened = await store.open(handle.id, 'read')
+      try {
+        const durable = (await reopened.read(0)).events
+        assert.deepEqual(durable, back, 'reopened storage reads the admitted bytes, not just the live writer')
+        return durable
+      } finally {
+        await reopened.close()
+      }
     } finally {
       await handle.close()
     }
   } finally {
+    await plugin.dispose()
     rmSync(root, { recursive: true, force: true })
   }
 }

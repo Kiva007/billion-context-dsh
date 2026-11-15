@@ -27,8 +27,9 @@
  * `tokens` field that IS the fixed heuristic, so the fallback reads it.
  */
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
+import type { ContentBlock } from '@deepseek-ai/dsh-llm';
 /** The host's model-visible content block union (structural, mirror-side only). */
-export type HostBlock = {
+export type HostBlock = ContentBlock | {
     type: 'text';
     text: string;
 } | {
@@ -50,15 +51,16 @@ export type HostContent = readonly HostBlock[] | string;
 /**
  * Exact mirror of the host's `estimateContent`
  * (`@deepseek-ai/dsh-token-meter/lib/types/estimate.js`): text/reasoning
- * `ceil(len/4)+4`, tool-call `ceil(name/4)+ceil(arguments/4)+4`, tool-result
- * recursive over its content, unknown blocks `4+ceil(JSON.stringify/4)` over
+ * `ceil(len/4)+4`, tool-call `ceil(name/4)+ceil(arguments/4)+4`, all other
+ * blocks (including legacy tool-result wrappers) `4+ceil(JSON.stringify/4)` over
  * the ORIGINAL block object. A string content is iterated as an iterable, so
  * every CHARACTER falls to the default branch (`4+ceil(JSON.stringify(char)/4)`
  * — 5 tokens for any single unescaped character).
  */
 export declare function estimateHostContent(blocks: HostContent): number;
-/** Exact mirror of the host's `estimateMessage` (content + role framing). */
+/** Exact mirror of the host's message framing, including rendered system text. */
 export declare function estimateHostMessage(message: {
+    role?: string;
     content: HostContent;
 }): number;
 /**
@@ -82,9 +84,9 @@ export declare function shadowedHostTokens(session: Session, seqs: readonly numb
  * if the picture were free. It is a DISPLAY price only; it must never reach a
  * `shadowedTokenCount` claim (rule 12).
  *
- * UPSTREAM: drop this mirror the moment dsh-token-meter exports
- * `estimateStructuralBlock` (same tracker entry as `estimateContent`, see
- * docs/dsh-porting-verification.md).
+ * rc1 exports the pure estimator, but retained older hosts do not. Keep this
+ * compatibility mirror without a mandatory runtime subpath import; parity tests
+ * compare it with the published estimator.
  */
 export declare function hostMediaStructuralPrice(blocks: unknown): number;
 /**

@@ -67,7 +67,10 @@ export declare function windowSourceLabel(window: AcpWindow): string;
  * host on every request, so it follows the real model without any config.
  * Returns null when the host exposes no projection or disclosed no window.
  */
-export declare function projectedContextWindow(agent: Agent): number | null;
+export declare function projectedContextWindow(agent: Agent, route?: {
+    provider: string;
+    model: string;
+}): number | null;
 /**
  * Read the LIVE model route from the session's last `request/context` event.
  * After a mid-session model switch `agent.options` is a stale snapshot (it
@@ -82,15 +85,12 @@ export declare function liveRoute(agent: Agent): {
     provider: string;
     model: string;
 } | null;
-/**
- * The route the per-route output cap and the compression provenance must be
- * resolved against, in ONE place: the session's live `request/context` route,
- * falling back to `agent.options` only before the session has recorded any
- * route. `windowFor` (src/index.ts), the `compress` tool (src/tools.ts) and
- * `/acp-prune compress` (src/commands.ts) all need this exact pair; three hand-copied
- * copies is precisely how a stale-route bug gets fixed in one call site and
- * left behind in the others.
- */
+/** Next-step capacity uses the live choice; durable provenance still uses routeFor. */
+export declare function selectedRoute(agent: Agent): {
+    provider: string;
+    model: string;
+} | null;
+/** The route actually used by the request, for durable compression provenance. */
 export declare function routeFor(agent: Agent): {
     provider: string;
     model: string;

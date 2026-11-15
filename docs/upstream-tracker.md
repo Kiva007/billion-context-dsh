@@ -1,5 +1,7 @@
 # Upstream 追踪表
 
+> Local branch now consumes unchanged kernel 0.0.198 from monorepo commit `3e42aae8bfa6d2f3bf48d376eaaaac27afbcf806`; exact file hashes are in `vendor/acp-kernel/snapshot.json`. The historical npm 0.0.101 rows below remain provenance. The large-corpus `Math.max(...scores)` crash is fixed by upstream reduce in this snapshot; CJK char-floor tail omission remains characterized (4 versus latin 6 on the fixture), not patched locally. See [verified upgrade](kernel-0198-dsh-022rc1-verification.md).
+
 本仓库依赖上游 [acp-kernel](https://github.com/ranxianglei/acp-kernel) 与 DeepSeek Harness。
 按 AGENTS.md 规则 11,上游缺陷一律走「上游 issue + PR → 升级 pin → 解除本地 workaround」,
 任何本地 workaround 必须在此表登记,上游修复合入发布后**必须删除**。

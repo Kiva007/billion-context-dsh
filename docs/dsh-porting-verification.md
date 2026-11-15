@@ -1,6 +1,14 @@
 # DSH 移植验证报告与可行路径
 
+> Local upgrade: unchanged acp-kernel 0.0.198 + exact DSH 0.2.2-rc.1 verification: [upgrade evidence](kernel-0198-dsh-022rc1-verification.md). Prior rc.5 local evidence remains below.
+
 > 本文档是移植前验证的完整记录：每一项论断都有源码/运行证据，最后给出经过验证的可行路径。前置背景见 [dsh-porting-analysis.md](dsh-porting-analysis.md)。
+
+## 本机补充：精确 DSH 0.2.1-rc.5（2026-10-31）
+
+本地分支基于 v0.2.27 / 637d175e，仅在 peer 约束追加 `|| 0.2.1-rc.5`，不放开其他 0.2.1 版本，也不豁免宿主门禁。真实 Windows Electron-as-node CLI + 内置 0.2.1-rc.5、全隔离 HOME/DSH_HOME、假 Chat 服务验证：旧版门禁跳过 bundle；追加精确版本后，首请求四工具齐全，200 行旧用户资料压缩后出站原文降至 0，冷进程恢复仍为 0；search_context 找到原词，decompress 从真实 writer 保存的 v4 日志恢复完整200行。所有出站请求工具配对平衡，原始事件仍在 append-only 日志；无运行算法源码更改。宿主 GUI 及真实模型质量不在该验证范围。
+
+可复现实验与机器结果在工作区 `test_output/bili-legacy-compat/runtime/`：`run.mjs`、`assert-e2e.mjs`、`case2/result.json`、`case2/wire.jsonl`。新增 `tests/local-rc5-compat.test.ts` 先红后绿，并确保 rc.4/rc.6/final 继续拒绝。原有 suite 在0.2.0 dev基线403通过、13跳过；当前rc.5真实writer已由独立CLI冷恢复覆盖，不把旧dev基线suite冒充新宿主suite。
 
 ## 第一部分：验证结果
 

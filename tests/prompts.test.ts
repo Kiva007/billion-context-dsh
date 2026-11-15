@@ -113,7 +113,8 @@ test('M4/prompts 2: default normal nudge — efficiency note + tip, guidance mov
   // No "suggestion, not a requirement"
   assert.ok(!text.includes('suggestion, not a requirement'), 'no "suggestion, not a requirement"')
   // Tip at end (kernel 0.0.101 copy: the batch fold is ONE call, array OR plain-string form)
-  assert.ok(text.endsWith('💡 If you compress, fold the ranges you keep in ONE call — pass multiple content entries (`content: [{...}, {...}]`) or ONE plain string holding every range, each block starting with its \'mNNNNN–mNNNNN topic\' header line (most robust through lossy gateways). Ranges the task still needs can wait — they reappear in later nudges.'), 'tip at end')
+  assert.ok(text.endsWith('Ranges the task still needs can wait — they reappear in later nudges.'), 'advisory batch tip at end')
+  assert.ok(!text.includes('ONE plain string'), 'no contradictory string dialect')
 })
 
 test('M4/prompts 2b: default nudge renders through the kernel renderNudgeText path (seq table replaces ref table)', () => {
@@ -125,7 +126,8 @@ test('M4/prompts 2b: default nudge renders through the kernel renderNudgeText pa
   // Kernel frame + tip verbatim；B6 起哲学/规则段被摘掉（改住系统提示）
   assert.ok(text.startsWith('This is an efficiency nudge to compress early and keep context lean — not an overflow warning.'), 'kernel EFFICIENCY_NOTE frame')
   assert.ok(!text.includes('HOW TO COMPRESS'), 'B6：规则段不在 nudge')
-  assert.ok(text.endsWith('💡 If you compress, fold the ranges you keep in ONE call — pass multiple content entries (`content: [{...}, {...}]`) or ONE plain string holding every range, each block starting with its \'mNNNNN–mNNNNN topic\' header line (most robust through lossy gateways). Ranges the task still needs can wait — they reappear in later nudges.'), 'kernel batch tip at end')
+  assert.ok(text.endsWith('Ranges the task still needs can wait — they reappear in later nudges.'), 'array dialect advisory tip at end')
+  assert.ok(!text.includes('ONE plain string'), 'no string-only tip')
   // Ref-ID rangesStr replaced by the surface-seq table. The title KEEPS the
   // kernel header format ("N, oldest first") with the seq dialect appended —
   // the kernel mN range rows are what must be gone.
@@ -500,4 +502,19 @@ test('M4/prompts 15: engine construction fails fast on a template typo', () => {
   // Group-level null from YAML-ish input is tolerated (whole group falls back).
   const engine = new Named(new Context(), { prompts: { nudge: null } } as never)
   assert.equal(engine.prompts.nudge.normal, DEFAULT_PROMPTS.nudge.normal)
+})
+
+test('new kernel candidate rejected by host guards never leaks its raw range or string-only instructions', () => {
+  const session = buildTextSession(4)
+  const decision = fakeDecision(96, true)
+  decision.compressibleRanges = [{ startRef: 'm00001', endRef: 'm00001', count: 1, tokens: 5000, toolPct: 0, textPct: 100 }]
+  for (const emergency of [false, true]) {
+    const value = { ...decision, breakdown: { ...decision.breakdown!, overLimit: emergency ? 1 : 0, emergencyOverride: emergency ? 1 : 0 } }
+    const text = buildNudgeText(value, emergency, session, wholeSurfaceRangeView(session))
+    assert.ok(text.includes('No host-safe compressible ranges'), text)
+    assert.ok(!text.includes('m00001–m00001'), text)
+    assert.ok(!text.includes('ONE call, ONE string'), text)
+    assert.ok(!text.includes('ONE plain string'), text)
+    assert.ok(text.includes('compress({ content: [{ startSeq, endSeq, summary }] })'), text)
+  }
 })

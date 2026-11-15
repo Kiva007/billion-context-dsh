@@ -427,29 +427,25 @@ function adaptKernelNudgeToSeq(
     out = replaceEmergencyExample(out)
   }
   // Replace the ref-ID range table (mNNNNN) with the surface-seq table.
-  // A zero-range table leaves the kernel's own "[No specific ranges detected]"
-  // notice intact — it is a better prompt than an empty table.
+  // An empty guarded table must replace kernel candidates too: those candidates
+  // can be forbidden by host instruction, pairing or recent-tail guards.
   const seqTable = rangeTable(session, kernelView, prompts, mediaPriceOf)
-  if (seqTable !== '') out = replaceRangesStr(out, seqTable)
+  out = replaceRangesStr(out, seqTable || '\n[No host-safe compressible ranges: current surface guards protect all candidates. Keep active work live; wait for a later nudge.]')
+  out = out.replace(/^ONE call, ONE string[^\n]*$/gm, CONTENT_FORM_NOTE + '\n\n' + ARRAY_BATCH_TIP)
+    .replace(/^💡 If you compress[^\n]*$/gm, ARRAY_BATCH_TIP)
   out = insertContentFormNote(out)
   return out
 }
 
-/**
- * The kernel's batch tip (0.0.101) advertises TWO content forms — the array
- * form and a plain string ("most robust through lossy gateways"). This tool's
- * schema takes the array form only: our ref dialect is surface seqs, and
- * `content` must be `[{ startSeq, endSeq, summary }]`. Rather than rewrite the
- * kernel's copy (rule 9: the kernel owns the prompt), the engine states the
- * difference in ONE line, placed BEFORE the tip so the tip stays the last
- * thing the model reads. Without it a model that follows the tip gets a schema
- * rejection it has to re-learn from mid-batch.
- */
+/** The upstream string-only batch dialect must match this host's array schema. */
+const ARRAY_BATCH_TIP = '💡 If you compress, fold the ranges you keep in ONE call — pass multiple content entries (`content: [{...}, {...}]`). Ranges the task still needs can wait — they reappear in later nudges.'
+
 const CONTENT_FORM_NOTE =
   'Note: this tool takes the array form only — compress({ content: [{ startSeq, endSeq, summary }] }) with the surface seqs above; a plain-string content is rejected.'
 
 /** Insert the array-form note right before the kernel's closing tip (no tip → text unchanged). */
 function insertContentFormNote(text: string): string {
+  if (text.includes(CONTENT_FORM_NOTE)) return text
   const tipAt = text.lastIndexOf('\n\n\u{1F4A1} ')
   if (tipAt === -1) return text
   return text.slice(0, tipAt) + '\n\n' + CONTENT_FORM_NOTE + text.slice(tipAt)

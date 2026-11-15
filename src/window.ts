@@ -98,7 +98,12 @@ interface ProjectionProbe {
  * host on every request, so it follows the real model without any config.
  * Returns null when the host exposes no projection or disclosed no window.
  */
-export function projectedContextWindow(agent: Agent): number | null {
+export function projectedContextWindow(agent: Agent, route?: { provider: string; model: string }): number | null {
+  if (route !== undefined) {
+    const recorded = liveRoute(agent)
+    // A newly selected route has no pressure projection until its first request.
+    if (recorded === null || recorded.provider !== route.provider || recorded.model !== route.model) return null
+  }
   const projections = agent.ctx?.get?.('sessionProjections') as ProjectionProbe | undefined
   const window = projections?.snapshot?.(agent.session)?.values?.contextPressure?.contextWindow
   if (typeof window === 'number' && Number.isInteger(window) && window > 0) return window
@@ -137,15 +142,21 @@ export function liveRoute(agent: Agent): { provider: string; model: string } | n
   return { provider, model }
 }
 
-/**
- * The route the per-route output cap and the compression provenance must be
- * resolved against, in ONE place: the session's live `request/context` route,
- * falling back to `agent.options` only before the session has recorded any
- * route. `windowFor` (src/index.ts), the `compress` tool (src/tools.ts) and
- * `/acp-prune compress` (src/commands.ts) all need this exact pair; three hand-copied
- * copies is precisely how a stale-route bug gets fixed in one call site and
- * left behind in the others.
- */
+/** Next-step capacity uses the live choice; durable provenance still uses routeFor. */
+export function selectedRoute(agent: Agent): { provider: string; model: string } | null {
+  try {
+    const selected = agent.model?.current?.()
+    if (typeof selected?.provider === 'string' && selected.provider !== ''
+      && typeof selected.model === 'string' && selected.model !== '') {
+      return { provider: selected.provider, model: selected.model }
+    }
+  } catch {
+    // Legacy or unavailable model service: keep the recorded request fallback.
+  }
+  return null
+}
+
+/** The route actually used by the request, for durable compression provenance. */
 export function routeFor(agent: Agent): { provider: string; model: string } {
   const live = liveRoute(agent)
   return {

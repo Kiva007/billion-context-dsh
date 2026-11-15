@@ -223,7 +223,10 @@ export declare class AcpCompactionEngine extends CompactionEngine {
      * exact value (they own the denominator); a failed probe keeps the raw
      * fallback.
      */
-    windowFor(agent: Agent): Promise<AcpWindow>;
+    windowFor(agent: Agent, selection?: {
+        readonly provider: string;
+        readonly model: string;
+    }): Promise<AcpWindow>;
     /**
      * Diff handler for runtime settings changes: drop the window cache when a
      * window-related key changed (probe FAILURES are cached too — clearing is

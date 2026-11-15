@@ -28,6 +28,7 @@
  */
 
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
 import { deriveEventMessage } from '@deepseek-ai/dsh-session'
 import { eventAtOf } from './session-events.ts'
 
@@ -40,6 +41,7 @@ const ROLE_OVERHEAD = 4
 
 /** The host's model-visible content block union (structural, mirror-side only). */
 export type HostBlock =
+  | ContentBlock
   | { type: 'text'; text: string }
   | { type: 'reasoning'; text: string }
   | { type: 'tool-call'; name: string; arguments: string }
@@ -58,8 +60,8 @@ function blockType(block: unknown): string | undefined {
 /**
  * Exact mirror of the host's `estimateContent`
  * (`@deepseek-ai/dsh-token-meter/lib/types/estimate.js`): text/reasoning
- * `ceil(len/4)+4`, tool-call `ceil(name/4)+ceil(arguments/4)+4`, tool-result
- * recursive over its content, unknown blocks `4+ceil(JSON.stringify/4)` over
+ * `ceil(len/4)+4`, tool-call `ceil(name/4)+ceil(arguments/4)+4`, all other
+ * blocks (including legacy tool-result wrappers) `4+ceil(JSON.stringify/4)` over
  * the ORIGINAL block object. A string content is iterated as an iterable, so
  * every CHARACTER falls to the default branch (`4+ceil(JSON.stringify(char)/4)`
  * — 5 tokens for any single unescaped character).
@@ -87,19 +89,33 @@ export function estimateHostContent(blocks: HostContent): number {
           + BLOCK_OVERHEAD
         break
       }
-      case 'tool-result': {
-        tokens += estimateHostContent((block as { content: HostContent }).content) + BLOCK_OVERHEAD
-        break
-      }
       default:
-        tokens += BLOCK_OVERHEAD + Math.ceil(JSON.stringify(block).length / CHARS_PER_TOKEN)
+        tokens += estimateHostStructuralBlock(block)
     }
   }
   return tokens
 }
 
-/** Exact mirror of the host's `estimateMessage` (content + role framing). */
-export function estimateHostMessage(message: { content: HostContent }): number {
+/** Image offload is request state, never part of the fixed ledger price. */
+function estimateHostStructuralBlock(block: HostBlock): number {
+  if (block.type === 'image') {
+    const { offloaded: _offloaded, ...reference } = block
+    return BLOCK_OVERHEAD + Math.ceil(JSON.stringify(reference).length / CHARS_PER_TOKEN)
+  }
+  return BLOCK_OVERHEAD + Math.ceil(JSON.stringify(block).length / CHARS_PER_TOKEN)
+}
+
+/** Exact mirror of the host's message framing, including rendered system text. */
+export function estimateHostMessage(message: { role?: string; content: HostContent }): number {
+  if (message.role === 'system') {
+    if (message.content.length === 0) return 0
+    let characters = 0
+    for (const block of message.content) {
+      characters += typeof block === 'object' && block.type === 'text'
+        ? (block as { text: string }).text.length : JSON.stringify(block).length
+    }
+    return Math.ceil(characters / CHARS_PER_TOKEN) + ROLE_OVERHEAD
+  }
   return estimateHostContent(message.content) + ROLE_OVERHEAD
 }
 
@@ -110,7 +126,7 @@ export function estimateHostMessage(message: { content: HostContent }): number {
  */
 export function hostPriceEvent(event: SessionEvent): number {
   const message = deriveEventMessage(event)
-  return message === null ? 0 : estimateHostMessage(message as { content: HostContent })
+  return message === null ? 0 : estimateHostMessage(message)
 }
 
 /** Mirror price of a set of surface seqs (the fallback claim computation). */
@@ -136,9 +152,9 @@ export function shadowedHostTokens(session: Session, seqs: readonly number[]): n
  * if the picture were free. It is a DISPLAY price only; it must never reach a
  * `shadowedTokenCount` claim (rule 12).
  *
- * UPSTREAM: drop this mirror the moment dsh-token-meter exports
- * `estimateStructuralBlock` (same tracker entry as `estimateContent`, see
- * docs/dsh-porting-verification.md).
+ * rc1 exports the pure estimator, but retained older hosts do not. Keep this
+ * compatibility mirror without a mandatory runtime subpath import; parity tests
+ * compare it with the published estimator.
  */
 export function hostMediaStructuralPrice(blocks: unknown): number {
   if (!Array.isArray(blocks)) return 0
@@ -147,7 +163,7 @@ export function hostMediaStructuralPrice(blocks: unknown): number {
     if (block === null || typeof block !== 'object') continue
     const b = block as { type?: unknown; content?: unknown }
     if (b.type === 'image' || b.type === 'file') {
-      tokens += BLOCK_OVERHEAD + Math.ceil(JSON.stringify(block).length / CHARS_PER_TOKEN)
+      tokens += estimateHostStructuralBlock(block as HostBlock)
     } else if (Array.isArray(b.content)) {
       tokens += hostMediaStructuralPrice(b.content)
     }
@@ -157,6 +173,7 @@ export function hostMediaStructuralPrice(blocks: unknown): number {
 
 /** The slice of the live meter's measurement the engine may price from. */
 interface TokenMeterLike {
+  estimateMessage?(message: Message): number
   measure(session: Session): {
     nodes: ReadonlyArray<{
       seq: number
@@ -246,8 +263,9 @@ export function shadowedTokensViaMeter(
   seqs: readonly number[],
   ctx?: { get?(name: string): unknown } | null,
 ): number {
+  let meter: TokenMeterLike | undefined
   try {
-    const meter = ctx?.get?.('tokenMeter') as TokenMeterLike | undefined
+    meter = ctx?.get?.('tokenMeter') as TokenMeterLike | undefined
     if (meter?.measure !== undefined) {
       const bySeq = new Map(meter.measure(session).nodes.map((node) => [node.seq, node.heuristicTokens ?? node.tokens]))
       let total = 0
@@ -264,6 +282,22 @@ export function shadowedTokensViaMeter(
     }
   } catch {
     // Fall through to the mirror — the mirror IS the host vocabulary.
+  }
+  // Modern hosts expose their fixed estimator independently of measure(), which
+  // can fail before a step exists. Keep its receiver and avoid a runtime import:
+  // retained older hosts do not export the estimator subpath.
+  if (typeof meter?.estimateMessage === 'function') {
+    try {
+      let total = 0
+      for (const seq of seqs) {
+        const event = eventAtOf(session, seq)
+        const message = event === undefined ? null : deriveEventMessage(event)
+        if (message !== null) total += meter.estimateMessage(message)
+      }
+      return total
+    } catch {
+      // A detached service must still degrade to the fixed mirror.
+    }
   }
   return shadowedHostTokens(session, seqs)
 }
