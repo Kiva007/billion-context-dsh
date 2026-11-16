@@ -130,7 +130,7 @@ The PR title is enforced by CI (`.github/workflows/pr-lint.yml` → `scripts/che
 
 ## Verified local upgrade baseline (2026-11-15)
 
-This branch targets exact DSH 0.2.2-rc.1 with Cordis 4.1.0 / loader 1.1.0 / Schemastery 3.19.0 / Cosmokit 1.9.0. It retains historical peer ranges plus exact rc.5 and rc.1 exceptions; do not widen neighboring versions without verification. The historical dev baseline instructions below describe earlier releases and are superseded by this paragraph for this branch.
+This branch targets exact DSH 0.2.2-rc.3 with Cordis 4.1.0 / loader 1.1.0 / Schemastery 3.19.0 / Cosmokit 1.9.0. It retains historical peer ranges plus exact 0.2.1-rc.5, 0.2.2-rc.1 and 0.2.2-rc.3 exceptions; do not widen neighboring versions without verification. The historical dev baseline instructions below describe earlier releases and are superseded by this paragraph for this branch.
 
 The kernel is unchanged acp-kernel 0.0.198, vendored from billion-context commit 3e42aae8bfa6d2f3bf48d376eaaaac27afbcf806, consumed as file:vendor/acp-kernel. snapshot.json and tests/kernel-vendor.test.ts pin upstream bytes. No algorithm edits or dependency lifecycle hooks. Keep its LICENSE and visible documentation attribution, including the additional attribution term. Root tsup still inlines the kernel.
 

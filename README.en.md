@@ -3,7 +3,7 @@
 [English](./README.en.md) | [中文](./README.md)
 
 > **⚠️ Beta notice — not for production use**
-> This project (**v0.2.271**) is a work-in-progress beta. The [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) itself is also in **public beta**. **Do not use either in engineering / production environments** — expect breaking changes and rough edges.
+> This project (**v0.2.272**) is a work-in-progress beta. The [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) itself is also in **public beta**. **Do not use either in engineering / production environments** — expect breaking changes and rough edges.
 
 <p align="center">
 <strong>Built with gratitude on top of these projects</strong> — please give them a ⭐:
@@ -35,11 +35,11 @@ The model decides <em>when</em> and <em>what</em> to compress — not a hard lim
 
 ---
 
-> **Personal maintenance fork · v0.2.271**: based on [Tyan66666’s original project](https://github.com/Tyan66666/billion-context-dsh), with history and attribution preserved. This is not an upstream release. Install using `github:Kiva007/billion-context-dsh#v0.2.271`; the same-name npm package does not identify this fork’s version.
+> **Personal maintenance fork · v0.2.272**: based on [Tyan66666’s original project](https://github.com/Tyan66666/billion-context-dsh), with history and attribution preserved. This is not an upstream release. Install using `github:Kiva007/billion-context-dsh#v0.2.272`; the same-name npm package does not identify this fork’s version.
 
 ## Local upgrade branch: kernel and host baseline
 
-This branch uses unchanged acp-kernel **0.0.198** from [an immutable billion-context commit](https://github.com/ranxianglei/billion-context/tree/3e42aae8bfa6d2f3bf48d376eaaaac27afbcf806/kernel). Source, license and file hashes are retained in `vendor/acp-kernel`. It remains an in-process DSH CompactionEngine, not a proxy. Development dependencies target **DSH 0.2.2-rc.1**; outside the historical peer band only exact `0.2.1-rc.5` and `0.2.2-rc.1` are admitted, not neighboring releases.
+This branch uses unchanged acp-kernel **0.0.198** from [an immutable billion-context commit](https://github.com/ranxianglei/billion-context/tree/3e42aae8bfa6d2f3bf48d376eaaaac27afbcf806/kernel). Source, license and file hashes are retained in `vendor/acp-kernel`. It remains an in-process DSH CompactionEngine, not a proxy. Development dependencies target **DSH 0.2.2-rc.3**; outside the historical peer band only exact `0.2.1-rc.5` , `0.2.2-rc.1` and `0.2.2-rc.3` are admitted, not neighboring releases.
 
 The first step after model selection uses the host-captured choice for capacity and output reservation; compression provenance and overflow recovery retain the actual request route. The kernel now protects the latest 3 messages, while the adapter keeps its stricter 5-surface-node guard. Empty guarded candidates produce an explicit no-safe-range notice, never a raw kernel table. Tool-call examples are adapted to the accepted `content` array dialect without modifying kernel algorithms.
 
@@ -106,7 +106,7 @@ This only installs the package into your project/global store; it does **not** t
 **Install from the git source (`github:` spec — the form the plugin store shows).** The prebuilt `dist/` artifacts are committed to this repository, so a git-source install also works out of the box — **no build step needed**, and pnpm 11's default build-script blocking (`allowBuilds`) never applies to this package:
 
 ```bash
-dsh plugin --profile web add github:Tyan66666/billion-context-dsh#v0.2.271
+dsh plugin --profile web add github:Kiva007/billion-context-dsh#v0.2.272
 ```
 
 Prefer a `#<tag>` ref to get artifacts identical to that npm release; without a ref you get the latest default-branch build. Only building the repo yourself (`npm run build`) requires approving build scripts. Background and trade-offs: [docs/git-source-install-design.md](docs/git-source-install-design.md) (issue #92).
@@ -287,7 +287,7 @@ If you do not want to tune three percentages by hand, pick the nudge aggressiven
 
 ## Fixed issues
 
-> The item below is a real failure this project ran into. It is fixed in kernel **acp-kernel 0.0.101**, and this repo pins that version from **v0.2.271** on; older releases (≤ v0.2.26) still hit it.
+> The item below is a real failure this project ran into. It is fixed in kernel **acp-kernel 0.0.101**, and the original adapter includes that fix from **v0.2.27** on; this fork uses the newer 0.0.198; older releases (≤ v0.2.26) still hit it.
 
 ### Long sessions hitting the kernel's ref cap: `ref capacity exhausted: cannot allocate beyond m99999` (fixed)
 
@@ -297,7 +297,7 @@ After an extremely long session (tens of thousands of message-level events), a w
 ref capacity exhausted: cannot allocate beyond m99999
 ```
 
-This is the upstream [acp-kernel](https://github.com/ranxianglei/acp-kernel) 5-digit ref space (`m00001`–`m99999`) being exhausted by the CUMULATIVE number of messages ever seen — ref numbers are never reused within a session (#176's slot recycling was reverted by #191 because reused refs let stale tags in summary text silently point at another message; #191 established the invariant), so it is unrelated to current context size. Back then it was confirmed on kernel 0.0.29, on the version pinned here at the time (0.0.63) and on the then-latest npm release (0.0.98) — every line carried `const MAX_INDEX = 99999`. **Fixed in acp-kernel 0.0.101**: the constant measured `99999` → `9999999` across the two `dist/index.js` builds, and this repo pins it from v0.2.271 on — **upgrade to v0.2.271 or later and the cap is gone; existing sessions keep working**.
+This is the upstream [acp-kernel](https://github.com/ranxianglei/acp-kernel) 5-digit ref space (`m00001`–`m99999`) being exhausted by the CUMULATIVE number of messages ever seen — ref numbers are never reused within a session (#176's slot recycling was reverted by #191 because reused refs let stale tags in summary text silently point at another message; #191 established the invariant), so it is unrelated to current context size. Back then it was confirmed on kernel 0.0.29, on the version pinned here at the time (0.0.63) and on the then-latest npm release (0.0.98) — every line carried `const MAX_INDEX = 99999`. **Fixed in acp-kernel 0.0.101**: the constant measured `99999` → `9999999` across the two `dist/index.js` builds, and the original adapter includes it from v0.2.27 on; this fork uses 0.0.198 — **upgrade to this fork v0.2.271 or later and the cap is gone; existing sessions keep working**.
 
 **Neither compression nor a restart recovers it**: this plugin feeds the FULL LOG (including everything shadowed by summaries) to the kernel on every turn (T2/T3 distillation requires the complete log, not just the visible surface — see the comment on `allLogMessages` at src/messages.ts:315), and the FIRST node of the kernel pipeline is `assign-refs`, which numbers every message in that log before any compression decision. So:
 
@@ -308,7 +308,7 @@ On kernels before 0.0.101, **"a log above ~100k message-level events = the sessi
 
 **What to do**:
 
-1. **Upgrade to v0.2.271 or later** (its pin carries acp-kernel 0.0.101) — the cap no longer triggers and the **existing session stays usable**, no need to start over.
+1. **Upgrade to this fork v0.2.271 or later** (its acp-kernel 0.0.198 includes the 0.0.101 fix) — the cap no longer triggers and the **existing session stays usable**, no need to start over.
 2. If you cannot upgrade yet: **fall back to rule-based compaction** — disable `compaction-acp` and enable the host's built-in `compaction-basic` in your profile, which bypasses the code path (the session itself stays usable); or **start a fresh session** — carry over what you need manually; the new session's ref count starts from zero and the wall only returns when its own log approaches ~100k events.
 
 ## Development

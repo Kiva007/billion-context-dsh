@@ -3,7 +3,7 @@
 [中文](./README.md) | [English](./README.en.md)
 
 > **⚠️ 测试版声明——请勿用于生产环境**
-> 本项目（**v0.2.271**）仍处于开发中的测试版。[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 本身也处于**公开测试版**阶段。**请勿将两者用于工程化 / 生产环境**——预期会有破坏性变更与粗糙之处。
+> 本项目（**v0.2.272**）仍处于开发中的测试版。[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 本身也处于**公开测试版**阶段。**请勿将两者用于工程化 / 生产环境**——预期会有破坏性变更与粗糙之处。
 
 <p align="center">
 <strong>衷心感谢以下项目——请给它们一个 ⭐：</strong>
@@ -49,11 +49,11 @@
 
 这是 [billion-context-pi](https://github.com/ranxianglei/billion-context-pi)（Pi 编码代理适配器）在 DeepSeek Harness 上的移植：压缩内核（[acp-kernel](https://github.com/ranxianglei/acp-kernel)）原样复用，适配层针对 DSH 的 durable-surface 模型重写——经过验证的映射关系见 [docs](https://github.com/Tyan66666/billion-context-dsh/tree/main/docs)。
 
-> **个人维护 fork · v0.2.271**：本仓库保留 [Tyan66666 原项目](https://github.com/Tyan66666/billion-context-dsh) 的历史与署名，在其基础上维护 DSH 原生适配版；不是原作者的新发布。安装请使用 `github:Kiva007/billion-context-dsh#v0.2.271`，不要用 npm 同名包判断本 fork 版本。
+> **个人维护 fork · v0.2.272**：本仓库保留 [Tyan66666 原项目](https://github.com/Tyan66666/billion-context-dsh) 的历史与署名，在其基础上维护 DSH 原生适配版；不是原作者的新发布。安装请使用 `github:Kiva007/billion-context-dsh#v0.2.272`，不要用 npm 同名包判断本 fork 版本。
 
 ## 本地升级分支：内核与宿主基线
 
-本分支原样引入 acp-kernel **0.0.198**（[billion-context 固定提交](https://github.com/ranxianglei/billion-context/tree/3e42aae8bfa6d2f3bf48d376eaaaac27afbcf806/kernel)），来源、许可证和文件哈希保存在 `vendor/acp-kernel`。仍是 DSH 进程内 CompactionEngine，不启动代理。开发依赖基线为 **DSH 0.2.2-rc.1**；peer 在旧范围外仅额外允许精确 `0.2.1-rc.5` 与 `0.2.2-rc.1`，不代表其他 0.2.2 版本已验证。
+本分支原样引入 acp-kernel **0.0.198**（[billion-context 固定提交](https://github.com/ranxianglei/billion-context/tree/3e42aae8bfa6d2f3bf48d376eaaaac27afbcf806/kernel)），来源、许可证和文件哈希保存在 `vendor/acp-kernel`。仍是 DSH 进程内 CompactionEngine，不启动代理。开发依赖基线为 **DSH 0.2.2-rc.3**；peer 在旧范围外仅额外允许精确 `0.2.1-rc.5` 、`0.2.2-rc.1` 与 `0.2.2-rc.3`，不代表其他 0.2.2 版本已验证。
 
 模型切换后的首步使用宿主捕获的选择计算窗口和输出预留；压缩来源及超窗恢复仍使用实际请求路由。新版内核保留最近 3 条消息，DSH 侧仍施加更保守的最近 5 个 surface 节点保护；被宿主过滤为空的范围明确显示无安全候选，不退回内核原始引用表。模型提示中的调用示例统一适配为本工具接受的 `content` 数组，压缩算法不改写。
 
@@ -106,7 +106,7 @@ npm install billion-context-dsh
 **git 源安装（`github:` 规格，插件商店展示的形态）。** 预构建产物 `dist/` 已提交到仓库，从 git 源安装同样开箱即用——**无需任何构建步骤**，pnpm 11 默认拦截构建脚本（`allowBuilds`）的机制对这个包不构成障碍：
 
 ```bash
-dsh plugin --profile web add github:Tyan66666/billion-context-dsh#v0.2.271
+dsh plugin --profile web add github:Kiva007/billion-context-dsh#v0.2.272
 ```
 
 建议带 `#<tag>` 安装，拿到与对应 npm 版本完全一致的产物；不带 ref 则装默认分支的最新构建。只有 clone 仓库自行从源码构建（`npm run build`）才需要放行构建。背景与方案取舍见 [docs/git-source-install-design.md](docs/git-source-install-design.md)（issue #92）。
@@ -285,7 +285,7 @@ DSH 的每个模型请求都派生自其 append-only 会话日志（*surface*）
 
 ## 已修复的问题
 
-> 下面这条是本项目自己撞出来的真实故障。已在内核 **acp-kernel 0.0.101** 修复，本仓 **v0.2.271** 起 pin 到该版本；老版本（≤ v0.2.26）仍会遇到。
+> 下面这条是本项目自己撞出来的真实故障。已在内核 **acp-kernel 0.0.101** 修复，上游适配版自 **v0.2.27** 起包含该修复，本 fork 使用更高版本 0.0.198；老版本（≤ v0.2.26）仍会遇到。
 
 ### 长会话撞上内核引用上限：`ref capacity exhausted: cannot allocate beyond m99999`（已修复）
 
@@ -296,7 +296,7 @@ DSH 的每个模型请求都派生自其 append-only 会话日志（*surface*）
 ref capacity exhausted: cannot allocate beyond m99999
 ```
 
-这是上游 [acp-kernel](https://github.com/ranxianglei/acp-kernel) 的 5 位引用编号空间（`m00001`–`m99999`）被**累计**见过的消息数耗尽——引用编号在会话内只增不复用（#176 的槽复用因会让摘要里的旧 tag 静默指向另一条消息而被 #191 回退，#191 确立该不变量），与当前上下文大小无关。当时确认内核 0.0.29、本仓当时 pin 的 0.0.63、以及当时的 npm 最新版 0.0.98 全部同样命中（`refs.ts` 的 `MAX_INDEX = 99999`）。**已在 acp-kernel 0.0.101 修复**：两版 `dist/index.js` 的常量实测为 `99999` → `9999999`，本仓 v0.2.271 起 pin 到该版本——**升级到 v0.2.271 及以上即不再撞限，旧会话无需重建**。
+这是上游 [acp-kernel](https://github.com/ranxianglei/acp-kernel) 的 5 位引用编号空间（`m00001`–`m99999`）被**累计**见过的消息数耗尽——引用编号在会话内只增不复用（#176 的槽复用因会让摘要里的旧 tag 静默指向另一条消息而被 #191 回退，#191 确立该不变量），与当前上下文大小无关。当时确认内核 0.0.29、本仓当时 pin 的 0.0.63、以及当时的 npm 最新版 0.0.98 全部同样命中（`refs.ts` 的 `MAX_INDEX = 99999`）。**已在 acp-kernel 0.0.101 修复**：两版 `dist/index.js` 的常量实测为 `99999` → `9999999`，上游适配版 v0.2.27 起包含该修复，本 fork 的 0.0.198 同样包含——**升级到本 fork v0.2.271 或更高版本即不再撞限，旧会话无需重建**。
 
 **压缩救不回，重启也救不回**：本插件每轮把**整条日志**（含已被摘要遮蔽的部分）交给内核（T2/T3 蒸馏需要完整日志而不只是可见面——见 src/messages.ts:315 `allLogMessages` 的注释），而内核流水线的第一个节点就是 `assign-refs`，先给日志里的所有消息编号、然后才谈任何压缩决策。所以：
 
@@ -307,7 +307,7 @@ ref capacity exhausted: cannot allocate beyond m99999
 
 **处置**：
 
-1. **升级到 v0.2.271 及以上**（pin 含 acp-kernel 0.0.101）——撞限不再发生，**旧会话继续可用**，不必新建会话。
+1. **升级到本 fork v0.2.271 或更高版本**（使用 acp-kernel 0.0.198，包含 0.0.101 的修复）——撞限不再发生，**旧会话继续可用**，不必新建会话。
 2. 暂时无法升级时：**换回规则式压缩**——profile 里禁用 `compaction-acp`、启用宿主自带的 `compaction-basic`，绕开这条代码路径（会话本身仍可继续）；或 **换新会话**——把需要的上下文手动带过去，新会话的引用从零开始计数，等它自己的日志接近约 10 万条时才会再撞这堵墙。
 
 ## 开发
